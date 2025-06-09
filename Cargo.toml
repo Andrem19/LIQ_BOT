@@ -1,0 +1,16 @@
+[package]
+name = "raydium_clmm_bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Anchor-клиент для общения с программой
+anchor-client = "0.31.1"
+# Rust SDK для CLMM Raydium
+raydium-amm-v3 = "0.1.0"
+# Solana-клиент и SDK
+solana-client = "1.14.19"
+solana-sdk    = "1.14.19"
+# Асинхронные операции
+tokio          = { version = "1", features = ["full"] }
+anyhow         = "1.0"
