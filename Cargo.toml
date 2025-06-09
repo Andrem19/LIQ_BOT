@@ -14,3 +14,7 @@ solana-sdk    = "1.14.19"
 # Асинхронные операции
 tokio          = { version = "1", features = ["full"] }
 anyhow         = "1.0"
+
+[[bin]]
+name = "test"
+path = "test.rs"

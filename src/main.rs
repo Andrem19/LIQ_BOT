@@ -1,219 +1,155 @@
 // src/main.rs
 
-use std::str::FromStr;
-use std::time::Duration;
+mod params;
+mod utils;
+mod telegram;
 
 use anyhow::Result;
-use anchor_client::{Client, Cluster};
-use raydium_amm_v3::{
-    ID as CLMM_PROGRAM_ID,
-    instruction::{increase_liquidity, decrease_liquidity, collect_fees},
-    util::tick_math::{price_to_tick, tick_to_price},
-    state::PoolState,
+use std::str::FromStr;
+use tokio::select;
+use tokio::time::{interval, Instant};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::signature::Keypair;
+use solana_sdk::pubkey::Pubkey;
+use raydium_amm_v3::util::tick_math::tick_to_price;
+
+use crate::params::{POOLS, CHECK_INTERVAL, REPORT_INTERVAL, RANGE_HALF};
+use crate::utils::{
+    load_keypair, create_rpc_client, create_program_client,
+    get_pool_state, compute_tick_range, get_token_balance,
+    withdraw_and_collect, deposit_liquidity, swap_token, send_tx,
 };
-use solana_account_decoder::UiAccountData;
-use solana_client::{
-    rpc_client::RpcClient,
-    rpc_filter::RpcTokenAccountsFilter,
-};
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    signature::{read_keypair_file, Keypair},
-    pubkey::Pubkey,
-    transaction::Transaction,
-};
-use tokio::time::interval;
+use telegram::Telegram;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1) Инициализация клиента и ключа
-    let keypair_path = dirs::home_dir().unwrap()
-        .join(".config/solana/mainnet-id.json");
-    let keypair: Keypair = read_keypair_file(&keypair_path)?;
-    let rpc_url = "https://api.mainnet-beta.solana.com";
-    let rpc_client = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
-    let client = Client::new_with_options(
-        Cluster::Custom(rpc_url.to_string(), rpc_url.to_string()),
-        keypair.clone(),
-        CommitmentConfig::confirmed(),
+    // 1) Загрузка ключа, RPC и Telegram
+    let keypair = load_keypair()?;
+    let rpc_client = create_rpc_client();
+    let telegram = Telegram::new(
+        &std::env::var("TELEGRAM_TOKEN")?,
+        &std::env::var("TELEGRAM_CHAT_ID")?,
     );
-    let program = client.program(CLMM_PROGRAM_ID);
 
-    // 2) Адрес CLMM-пула WSOL/USDC
-    let pool_pubkey = Pubkey::from_str("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv")?;
-
-    // 3) Настройки диапазона: ±0.25% (в сумме 0.5%)
-    const RANGE_HALF: f64 = 0.0025;
-
-    // 4) Переменные для состояния позиции
-    let mut has_position = false;
-    let mut lower_tick: i32 = 0;
-    let mut upper_tick: i32 = 0;
-
-    // 5) Запускаем цикл раз в 30 сек
-    let mut ticker = interval(Duration::from_secs(30));
-    loop {
-        ticker.tick().await;
-
-        // 6) Читаем состояние пула
-        let pool_state: PoolState = program.account(pool_pubkey)?;
-        let current_price: f64 = pool_state.price();      // цена USDC за WSOL
-        let tick_spacing: u16 = pool_state.tick_spacing as u16;
-
-        // 7) Рассчитываем новые границы
-        let lower_price = current_price * (1.0 - RANGE_HALF);
-        let upper_price = current_price * (1.0 + RANGE_HALF);
-        let new_lower_tick = price_to_tick(lower_price, tick_spacing)?;
-        let new_upper_tick = price_to_tick(upper_price, tick_spacing)?;
-
-        // 8) Если у нас ещё нет позиции — делаем initial deposit
-        if !has_position {
-            let amount_usdc: u128 = 400_u64 * 1_000_000_u128; // 400 USDC (6 dec)
-            let amount_wsol: u128 = ((400.0 / current_price) * 1e9) as u128;
-
-            let increase_ix = increase_liquidity(
-                &CLMM_PROGRAM_ID,
-                &pool_pubkey,
-                &program.payer(),
-                new_lower_tick,
-                new_upper_tick,
-                amount_usdc,
-                amount_wsol,
-            );
-
-            let mut tx = Transaction::new_with_payer(
-                &[increase_ix],
-                Some(&program.payer()),
-            );
-            let (recent_hash, _) = rpc_client.get_latest_blockhash()?;
-            tx.sign(&[&keypair], recent_hash);
-            let sig = rpc_client
-                .send_and_confirm_transaction(&tx)?;
-            println!("Initial liquidity deposited at price {:.6}, tx={}", current_price, sig);
-
-            // Запоминаем позицию
-            lower_tick = new_lower_tick;
-            upper_tick = new_upper_tick;
-            has_position = true;
-            continue;
-        }
-
-        // 9) Проверяем: вышла ли цена за старый диапазон?
-        let old_lower_price = tick_to_price(lower_tick, tick_spacing)?;
-        let old_upper_price = tick_to_price(upper_tick, tick_spacing)?;
-        if current_price < old_lower_price || current_price > old_upper_price {
-            println!("Price {:.6} out of [{:.6} – {:.6}], rebalancing…",
-                     current_price, old_lower_price, old_upper_price);
-
-            // 10) Снимаем старую позицию и собираем комиссии
-            let decrease_ix = decrease_liquidity(
-                &CLMM_PROGRAM_ID,
-                &pool_pubkey,
-                &program.payer(),
-                lower_tick,
-                upper_tick,
-                u128::MAX,
-            );
-            let collect_ix = collect_fees(
-                &CLMM_PROGRAM_ID,
-                &pool_pubkey,
-                &program.payer(),
-            );
-
-            // 11) Считаем текущие остатки USDC и WSOL
-            let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSS3ZQSijzCetra7T1Y9NPpF7Rmgv8dZ")?;
-            let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
-            let balance_usdc = get_token_balance(&rpc_client, &keypair.pubkey(), &usdc_mint)?;
-            let balance_wsol = get_token_balance(&rpc_client, &keypair.pubkey(), &wsol_mint)?;
-
-            // Общая стоимость в USDC (*1e6 для ламинатов)
-            let total_value = (balance_usdc as f64)
-                + (balance_wsol as f64) * current_price * (1e6 / 1e9);
-
-            // Целевая половина (в лампортах USDC и в вастах WSOL)
-            let target_usdc = (total_value / 2.0).round() as u128;
-            let target_wsol = ((total_value / 2.0) / current_price * 1e9).round() as u128;
-
-            // 12) Делаем swap, чтобы получить ровно target_usdc и target_wsol
-            // Здесь используем CLMM-swap инструкцию:
-            // Если у нас USDC слишком много — меняем USDC→WSOL, иначе WSOL→USDC.
-            let swap_ix = if (balance_usdc as u128) > target_usdc {
-                // USDC→WSOL
-                // В качестве примера: весь излишек меняем
-                let amount_in = (balance_usdc as u128) - target_usdc;
-                raydium_amm_v3::instruction::swap(
-                    &CLMM_PROGRAM_ID,
-                    &pool_pubkey,
-                    &program.payer(),
-                    amount_in,
-                    0, // не ставим лимит
-                )
-            } else {
-                // WSOL→USDC
-                let amount_in = (balance_wsol as u128) - target_wsol;
-                raydium_amm_v3::instruction::swap(
-                    &CLMM_PROGRAM_ID,
-                    &pool_pubkey,
-                    &program.payer(),
-                    amount_in,
-                    0,
-                )
-            };
-
-            // 13) Вносим обновлённую позицию
-            let increase_ix = increase_liquidity(
-                &CLMM_PROGRAM_ID,
-                &pool_pubkey,
-                &program.payer(),
-                new_lower_tick,
-                new_upper_tick,
-                target_usdc,
-                target_wsol,
-            );
-
-            // 14) Собираем все инструкции и шлём
-            let mut tx = Transaction::new_with_payer(
-                &[decrease_ix, collect_ix, swap_ix, increase_ix],
-                Some(&program.payer()),
-            );
-            let (recent_hash, _) = rpc_client.get_latest_blockhash()?;
-            tx.sign(&[&keypair], recent_hash);
-            let sig = rpc_client
-                .send_and_confirm_transaction(&tx)?;
-            println!("Rebalanced at price {:.6}, tx={}", current_price, sig);
-
-            // Обновляем состояние
-            lower_tick = new_lower_tick;
-            upper_tick = new_upper_tick;
-        }
-        // иначе — price внутри диапазона, ждём следующей итерации
+    // 2) Для каждого пула заводим свою задачу
+    let mut handles = Vec::new();
+    for cfg in POOLS.iter().cloned() {
+        let keypair = keypair.clone();
+        let rpc = rpc_client.clone();
+        let tele = telegram.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = monitor_pool(cfg, keypair, rpc, tele).await {
+                eprintln!("Ошибка в пуле {}: {:?}", cfg.name, e);
+            }
+        }));
     }
+
+    // 3) Ждём, чтобы main не завершился
+    futures::future::join_all(handles).await;
+    Ok(())
 }
 
-/// Возвращает баланс SPL-токена (в минимальных единицах, UInt64)
-fn get_token_balance(
-    rpc: &RpcClient,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Result<u64> {
-    use solana_account_decoder::UiAccountEncoding;
-    use solana_client::rpc_config::RpcAccountInfoConfig;
+/// Основной цикл мониторинга и ребалансировки для одного пула
+async fn monitor_pool(
+    cfg: params::PoolConfig,
+    keypair: Keypair,
+    rpc_client: RpcClient,
+    telegram: Telegram,
+) -> Result<()> {
+    let program = create_program_client(&keypair);
 
-    let resp = rpc.get_token_accounts_by_owner(
-        owner,
-        RpcTokenAccountsFilter::Mint(*mint),
-    )?;
-    if resp.is_empty() {
-        return Ok(0);
-    }
-    // Берём первый associated-аккаунт
-    let data = &resp[0].1.data;
-    if let UiAccountData::Json(parsed) = data {
-        let ui_amount = parsed.token_amount.ui_amount.unwrap_or(0.0);
-        let decimals = parsed.token_amount.decimals;
-        let lamports = (ui_amount * 10u64.pow(decimals as u32) as f64).round();
-        Ok(lamports as u64)
-    } else {
-        Ok(0)
+    // Парсим адреса
+    let pool_pubkey = Pubkey::from_str(cfg.pool_address)?;
+    let usdc_mint  = Pubkey::from_str(cfg.usdc_mint_address)?;
+    let wsol_mint  = Pubkey::from_str(cfg.wsol_mint_address)?;
+    let initial_value = cfg.initial_amount_usdc;
+
+    // Состояние позиции
+    let mut has_position = false;
+    let mut lower_tick    = 0;
+    let mut upper_tick    = 0;
+    let mut last_price    = 0.0;
+    let mut last_spacing  = 0;
+
+    let mut check_int  = interval(CHECK_INTERVAL);
+    let mut report_int = interval(REPORT_INTERVAL);
+
+    loop {
+        select! {
+            // 1) Интервал проверки цены
+            _ = check_int.tick() => {
+                let ( _state, price, spacing ) = get_pool_state(&program, &pool_pubkey)?;
+                last_price   = price;
+                last_spacing = spacing;
+
+                let (new_low, new_high) = compute_tick_range(price, spacing, RANGE_HALF)?;
+
+                if !has_position {
+                    // Initial deposit
+                    let amt_usdc = (cfg.initial_amount_usdc * 1e6) as u128;
+                    let amt_wsol = ((cfg.initial_amount_usdc / price) * 1e9) as u128;
+                    let ix = deposit_liquidity(&program, &pool_pubkey, new_low, new_high, amt_usdc, amt_wsol);
+                    let sig = send_tx(&rpc_client, &keypair, &[ix])?;
+                    println!("{}: initial deposit @ {:.6}, tx={}", cfg.name, price, sig);
+                    lower_tick = new_low;
+                    upper_tick = new_high;
+                    has_position = true;
+                } else {
+                    // Rebalance only if price out of old range
+                    let old_low_price  = tick_to_price(lower_tick, last_spacing)?;
+                    let old_high_price = tick_to_price(upper_tick, last_spacing)?;
+                    if price < old_low_price || price > old_high_price {
+                        println!("{}: price {:.6} outside [{:.6}–{:.6}], rebalancing...", cfg.name, price, old_low_price, old_high_price);
+
+                        // 1) withdraw + collect
+                        let mut ix = withdraw_and_collect(&program, &pool_pubkey, lower_tick, upper_tick);
+
+                        // 2) get balances
+                        let bal_usdc = get_token_balance(&rpc_client, &keypair.pubkey(), &usdc_mint)? as u128;
+                        let bal_wsol = get_token_balance(&rpc_client, &keypair.pubkey(), &wsol_mint)? as u128;
+
+                        // 3) calculate 50/50
+                        let total_usdc_val = bal_usdc as f64 / 1e6 + bal_wsol as f64 / 1e9 * price;
+                        let tgt_usdc = (total_usdc_val / 2.0 * 1e6).round() as u128;
+                        let tgt_wsol = ((total_usdc_val / 2.0) / price * 1e9).round() as u128;
+
+                        // 4) swap excess
+                        if bal_usdc > tgt_usdc {
+                            ix.push(swap_token(&program, &pool_pubkey, bal_usdc - tgt_usdc));
+                        } else if bal_wsol > tgt_wsol {
+                            ix.push(swap_token(&program, &pool_pubkey, bal_wsol - tgt_wsol));
+                        }
+
+                        // 5) new deposit
+                        ix.push(deposit_liquidity(&program, &pool_pubkey, new_low, new_high, tgt_usdc, tgt_wsol));
+
+                        let sig = send_tx(&rpc_client, &keypair, &ix)?;
+                        println!("{}: rebalanced @ {:.6}, tx={}", cfg.name, price, sig);
+
+                        lower_tick = new_low;
+                        upper_tick = new_high;
+                    }
+                }
+            }
+
+            // 2) Интервал отчёта
+            _ = report_int.tick() => {
+                let bal_usdc = get_token_balance(&rpc_client, &keypair.pubkey(), &usdc_mint)? as u128;
+                let bal_wsol = get_token_balance(&rpc_client, &keypair.pubkey(), &wsol_mint)? as u128;
+                let total_usdc_val = bal_usdc as f64 / 1e6 + bal_wsol as f64 / 1e9 * last_price;
+                let profit = total_usdc_val - initial_value;
+                let low_p  = tick_to_price(lower_tick, last_spacing)?;
+                let high_p = tick_to_price(upper_tick, last_spacing)?;
+                telegram.send_pool_report(
+                    &cfg.name,
+                    last_price,
+                    low_p,
+                    high_p,
+                    bal_usdc,
+                    bal_wsol,
+                    profit,
+                ).await?;
+            }
+        }
     }
 }
