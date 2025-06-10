@@ -1,20 +1,26 @@
 [package]
-name = "raydium_clmm_bot"
+name = "orca_clmm_bot"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Anchor-клиент для общения с программой
-anchor-client = "0.31.1"
-# Rust SDK для CLMM Raydium
-raydium-amm-v3 = "0.1.0"
-# Solana-клиент и SDK
-solana-client = "1.14.19"
-solana-sdk    = "1.14.19"
-# Асинхронные операции
-tokio          = { version = "1", features = ["full"] }
-anyhow         = "1.0"
+# Все solana-* версии должны совпадать
+solana-client       = "2.2.7"
+solana-sdk = "2.2"
 
-[[bin]]
-name = "test"
-path = "test.rs"
+# Orca Whirlpools SDK
+orca_whirlpools_client      = "3.0"
+
+# Асинхронный рантайм и ошибки
+tokio                     = { version = "1", features = ["full"] }
+anyhow                    = "1.0"
+borsh = "1.5.7"
+reqwest = { version = "0.12.19", features = ["json"] }
+serde_json = "1.0"
+spl-token = "8.0.0"
+tracing = "0.1.41"
+serde = "1.0.219"
+hyperliquid_rust_sdk = "0.6.0"
+# [[bin]]
+# name = "test"
+# path = "test.rs"
