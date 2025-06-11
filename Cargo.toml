@@ -21,6 +21,8 @@ spl-token = "8.0.0"
 tracing = "0.1.41"
 serde = "1.0.219"
 hyperliquid_rust_sdk = "0.6.0"
+ethers = { version = "2", features = ["abigen","eip712"] }
+uuid = "1.17.0"
 # [[bin]]
 # name = "test"
 # path = "test.rs"

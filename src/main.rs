@@ -1,6 +1,7 @@
 mod telegram;
 mod params;
 mod utils;
+mod exchange;
 
 use anyhow::{Result, anyhow};
 use tokio::time::Duration;
