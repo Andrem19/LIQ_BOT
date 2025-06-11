@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::json;
 use tracing::debug;
+use crate::net::http_client;
 
 /// Минимальная обёртка над Telegram Bot API
 #[derive(Clone)]
@@ -15,7 +16,7 @@ pub struct Telegram {
 
 impl Telegram {
     pub fn new(token: &str, chat_id: &str) -> Self {
-        let client = Client::new();
+        let client = http_client();
         let token = token.to_string();
         let chat_id = chat_id.parse().expect("CHAT_ID должен быть integer");
         Telegram { client, token, chat_id }

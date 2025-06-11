@@ -13,7 +13,7 @@ use hyperliquid_rust_sdk::{
     ExchangeClient,
     ClientCancelRequest,
     ExchangeDataStatus, ExchangeResponseStatus,
-    ClientLimit, ClientOrder, ClientOrderRequest,
+    ClientOrder, ClientOrderRequest,
     MarketCloseParams, MarketOrderParams, ClientTrigger,
 };
 use std::{
@@ -87,7 +87,7 @@ impl HL {
 
     /// ENV-shortcut — HL_SECRET и опционально HL_SUBACCOUNT
     pub async fn new_from_env() -> Result<Self> {
-        let secret = env::var("HL_SECRET").map_err(|_| anyhow!("env HL_SECRET not set"))?;
+        let secret = env::var("HLSECRET_1").map_err(|_| anyhow!("env HL_SECRET not set"))?;
         let sub = env::var("HL_SUBACCOUNT").ok()
             .map(|s| s.parse::<H160>())
             .transpose()?;

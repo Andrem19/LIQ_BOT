@@ -18,6 +18,7 @@ EXCLUDED_CODE_DIRS = {
     os.path.normpath("graph.dot"),
     os.path.normpath("solana_pools.json"),
     os.path.normpath("src/visualizer"),
+    os.path.normpath("src/exchange"),
 }
 
 # Пути (файлы или директории), где нужно выводить только сигнатуры (Rust)
