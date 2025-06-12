@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     // 3. Открываем длинную позицию на 100 USDT
     //    reduce_only = false, amount_coins не используется в режиме открытия
     let (open_cloid, entry_price) = hl
-        .open_market_order(symbol, "Buy", 40.0, false, 0.0)
+        .open_market_order(symbol, "Sell", 40.0, false, 0.0)
         .await?;
     println!("Opened long position: cloid = {}, entry_price = {}", open_cloid, entry_price);
     println!("Wait 10 sec");
@@ -86,12 +86,12 @@ async fn main() -> Result<()> {
     println!("Position details: {:?}", position);
 
     // 5. Ставим стоп-лосс 1% от цены входа
-    hl.open_sl(symbol, "Buy", position.size, position.entry_px, 0.01)
+    hl.open_sl(symbol, "Sell", position.size, position.entry_px, 0.01)
         .await?;
     println!("Stop-loss set at 1%");
 
     // 6. Ждём одну минуту
-    sleep(Duration::from_secs(60)).await;
+    sleep(Duration::from_secs(20)).await;
 
     // 7. Узнаём текущий нереализованный PnL
     let position_after = hl
