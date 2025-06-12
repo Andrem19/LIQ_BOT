@@ -59,7 +59,10 @@ pub async fn fetch_pool_position_info(pool_cfg: &PoolConfig) -> Result<types::Po
 
     // Адреса whirlpool и позиции
     let whirl_addr = Pubkey::from_str(pool_cfg.pool_address)?;
-    let pos_addr   = Pubkey::from_str(pool_cfg.position_address)?;
+    let pos_addr = match pool_cfg.position_address {
+        Some(addr) => Pubkey::from_str(addr)?,
+        None => return Err(anyhow!("Position address not specified; открытие позиции ещё не выполнено")),
+    };
 
     // Считать состояние whirlpool и позиции
     let whirl_acc = rpc.get_account(&whirl_addr)?;

@@ -1,53 +1,57 @@
-// src/params.rs
-
 use std::time::Duration;
 
-/// RPC URL для Mainnet-Beta
 pub const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-
-/// Файл keypair в ~/.config/solana/
 pub const KEYPAIR_FILENAME: &str = "/home/jupiter/.config/solana/mainnet-id.json";
-
-/// Интервал проверки цены (секунды)
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Интервал отправки отчётов в Telegram (секунды)
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(30 * 60); // 30 минут
-
-/// Полуширина диапазона (0.25% → ширина 0.5%)
 pub const RANGE_HALF: f64 = 0.0025;
 
-/// Конфигурация одного пула Concentrated Liquidity
 #[derive(Clone)]
 pub struct PoolConfig {
     pub program: &'static str,
-    /// Удобное имя для лога и отчётов
     pub name: &'static str,
-    /// Адрес программы CLMM-пула
     pub pool_address: &'static str,
-    pub position_address: &'static str,
-    /// Mint-адрес USDC
+    /// Т.к. позиция может быть не открыта, теперь Option
+    pub position_address: Option<&'static str>,
     pub mint_A: &'static str,
-    /// Mint-адрес WSOL
     pub mint_B: &'static str,
-    /// Начальная сумма в USDC для первой заливки
     pub decimal_A: u16,
     pub decimal_B: u16,
     pub initial_amount_usdc: f64,
 }
 
-/// Список пулов, с которыми бот будет работать
 pub const POOLS: &[PoolConfig] = &[
     PoolConfig {
         program: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
         name: "WSOL/USDC",
-        pool_address: "4HppGTweoGQ8ZZ6UcCgwJKfi5mJD9Dqwy6htCpnbfBLW",
-        position_address: "D36CEDLtTrCpRR78zkgZ3ZdcX8LwHRfyR6oJmGxVfwVM",
+        pool_address: "Esvfxt3jMDdtTZqLF1fqRhDjzM8Bpr7fZxJMrK69PB7e",
+        position_address: Some("8TskD7A128Gwj864V2kHaqk4XngJhGdMbn3s2d6xR6nM"),
         mint_A: "So11111111111111111111111111111111111111112",
         mint_B: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         decimal_A: 9,
         decimal_B: 6,
-        initial_amount_usdc: 180.0,
+        initial_amount_usdc: 100.0,
     },
-    // Добавляйте сюда новые пулы по той же схеме
+    PoolConfig {
+        program: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+        name: "WSOL/USDC",
+        pool_address: "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+        position_address: Some("8TskD7A128Gwj864V2kHaqk4XngJhGdMbn3s2d6xR6nM"),
+        mint_A: "So11111111111111111111111111111111111111112",
+        mint_B: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        decimal_A: 9,
+        decimal_B: 6,
+        initial_amount_usdc: 100.0,
+    },
+    PoolConfig {
+        program: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+        name: "WSOL/USDC",
+        pool_address: "4HppGTweoGQ8ZZ6UcCgwJKfi5mJD9Dqwy6htCpnbfBLW",
+        position_address: Some("8TskD7A128Gwj864V2kHaqk4XngJhGdMbn3s2d6xR6nM"),
+        mint_A: "So11111111111111111111111111111111111111112",
+        mint_B: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        decimal_A: 9,
+        decimal_B: 6,
+        initial_amount_usdc: 100.0,
+    },
 ];
