@@ -107,6 +107,7 @@ mod utils {
 pub async fn open_whirlpool_position(
     price_low: f64,
     price_high: f64,
+    initial_amount_usdc: f64,
     pool: PoolConfig,
 ) -> Result<Pubkey> {
     // SDK
@@ -133,7 +134,7 @@ pub async fn open_whirlpool_position(
             .map_err(op("get_account mint_b"))?;
         Mint::unpack(&mb.data).map_err(op("Mint::unpack mint_b"))?.decimals
     };
-    let deposit = (pool.initial_amount_usdc * 10f64.powi(dec_b as i32)).round() as u64;
+    let deposit = (initial_amount_usdc * 10f64.powi(dec_b as i32)).round() as u64;
 
     // Инструкции
     let quote = open_position_instructions(
@@ -278,6 +279,7 @@ pub async fn summarize_harvest_fees(
 pub async fn open_with_funds_check(
     price_low:  f64,
     price_high: f64,
+    initial_amount_usdc: f64,
     pool:       PoolConfig,
 ) -> Result<Pubkey> {
     // 1) RPC, кошелёк, SDK
@@ -292,7 +294,7 @@ pub async fn open_with_funds_check(
 
     // 2) Берём из SDK готовые инструкции и квоту
     let dec_b      = pool.decimal_b as i32;
-    let deposit_b  = (pool.initial_amount_usdc * 10f64.powi(dec_b)).round() as u64;
+    let deposit_b  = (initial_amount_usdc * 10f64.powi(dec_b)).round() as u64;
     log::debug!("DEBUG: deposit_b_atoms = {}", deposit_b);
 
     let whirl_pk = Pubkey::from_str(pool.pool_address)?;

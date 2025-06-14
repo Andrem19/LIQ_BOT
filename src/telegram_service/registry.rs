@@ -2,8 +2,8 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 use crate::telegram_service::commands::Commander;
-use crate::telegram_service::engine::ServiceCommand;
-use crate::params::POOLS;
+use crate::telegram_service::tl_engine::ServiceCommand;
+use crate::params::POOL;
 use crate::wirlpool_services::{
     get_info::fetch_pool_position_info,
     wirlpool::{
@@ -17,8 +17,23 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Регистрация всех телеграм-команд
-pub async fn register_commands(commander: &Commander, tx: UnboundedSender<ServiceCommand>) {
+pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceCommand>) {
     let tx = Arc::new(tx);
+
+    {
+        let c = Arc::clone(&commander);
+        let t = Arc::clone(&tx);
+        commander.add_command(&["info"], move |_params| {
+            let c2 = Arc::clone(&c);
+            let t2 = Arc::clone(&t);
+            async move {
+                let tree = c2.show_tree();
+                let _ = t2.send(ServiceCommand::SendMessage(
+                    format!("Доступные команды:\n{}", tree),
+                ));
+            }
+        });
+    }
 
     // 1. bal all
     commander.add_command(&["bal", "all"], {
@@ -26,7 +41,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
         move |_params| {
             let tx = Arc::clone(&tx);
             async move {
-                let pool = POOLS[0].clone();
+                let pool = POOL.clone();
                 let mut results = Vec::new();
                 for (idx, pos) in [pool.position_1.as_ref(), pool.position_2.as_ref(), pool.position_3.as_ref()].iter().enumerate() {
                     let msg = match pos.and_then(|p| p.position_address) {
@@ -47,28 +62,36 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let _ = tx.send(ServiceCommand::SendMessage(text));
             }
         }
-    }).await;
+    });
 
-    // 2. open --usize (открытие позиции)
+    // 2. open --pct --usize
     commander.add_command(&["open"], {
         let tx = Arc::clone(&tx);
         move |params| {
             let tx = Arc::clone(&tx);
             async move {
+                // --pct (ширина в %)
                 let pct = params.get(0)
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(0.4);
-                let pool = POOLS[0].clone();
+                // --usize (сумма в USDC)
+                let initial_amount_usdc = params.get(1)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(100.0);
+                let pool = POOL.clone();
                 let info_res = fetch_pool_position_info(&pool, None).await;
                 if let Ok(info) = info_res {
                     let cp = info.current_price;
                     let lower = cp * (1.0 - pct / 100.0);
                     let upper = cp * (1.0 + pct / 100.0);
-                    
-                    match open_whirlpool_position(lower, upper, pool.clone()).await {
+
+                    match open_whirlpool_position(lower, upper, initial_amount_usdc, pool.clone()).await {
                         Ok(mint) => {
                             let _ = tx.send(ServiceCommand::SendMessage(
-                                format!("✅ Открыта новая позиция c диапазоном ±{:.2}%\nNFT mint: {}", pct, mint)
+                                format!(
+                                    "✅ Открыта новая позиция c диапазоном ±{:.2}% на сумму {:.2} USDC\nNFT mint: {}",
+                                    pct, initial_amount_usdc, mint
+                                )
                             ));
                         }
                         Err(e) => {
@@ -84,9 +107,9 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 }
             }
         }
-    }).await;
+    });
 
-    // open fc --usize (открытие позиции с проверкой средств)
+    // open fc --pct --usize
     commander.add_command(&["open", "fc"], {
         let tx = Arc::clone(&tx);
         move |params| {
@@ -95,16 +118,23 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let pct = params.get(0)
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(0.4);
-                let pool = POOLS[0].clone();
+                let initial_amount_usdc = params.get(1)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(100.0);
+                let pool = POOL.clone();
                 let info_res = fetch_pool_position_info(&pool, None).await;
                 if let Ok(info) = info_res {
                     let cp = info.current_price;
                     let lower = cp * (1.0 - pct / 100.0);
                     let upper = cp * (1.0 + pct / 100.0);
-                    match open_with_funds_check(lower, upper, pool.clone()).await {
+
+                    match open_with_funds_check(lower, upper, initial_amount_usdc, pool.clone()).await {
                         Ok(mint) => {
                             let _ = tx.send(ServiceCommand::SendMessage(
-                                format!("✅ Открыта новая позиция (with funds check) c диапазоном ±{:.2}%\nNFT mint: {}", pct, mint)
+                                format!(
+                                    "✅ Открыта новая позиция (with funds check) c диапазоном ±{:.2}% на сумму {:.2} USDC\nNFT mint: {}",
+                                    pct, initial_amount_usdc, mint
+                                )
                             ));
                         }
                         Err(e) => {
@@ -120,7 +150,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 }
             }
         }
-    }).await;
+    });
 
     // 3. harvest all
     commander.add_command(&["harvest", "all"], {
@@ -128,10 +158,10 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
         move |_params| {
             let tx = Arc::clone(&tx);
             async move {
-                let pool = POOLS[0].clone();
+                let pool = POOL.clone();
                 let mut results = Vec::new();
                 for (idx, pos) in [pool.position_1.as_ref(), pool.position_2.as_ref(), pool.position_3.as_ref()].iter().enumerate() {
-                    let msg = match pos.and_then(|p| p.position_address) {
+                    let msg = match pos.and_then(|p| p.position_nft) {
                         Some(addr) => {
                             let mint_res = Pubkey::from_str(addr);
                             if let Ok(mint) = mint_res {
@@ -159,7 +189,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let _ = tx.send(ServiceCommand::SendMessage(text));
             }
         }
-    }).await;
+    });
 
     // harvest --usize (по конкретной позиции)
     commander.add_command(&["harvest"], {
@@ -168,14 +198,14 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
             let tx = Arc::clone(&tx);
             async move {
                 let pos_num = params.get(0).and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
-                let pool = POOLS[0].clone();
+                let pool = POOL.clone();
                 let pos = match pos_num {
                     1 => pool.position_1.as_ref(),
                     2 => pool.position_2.as_ref(),
                     3 => pool.position_3.as_ref(),
                     _ => None,
                 };
-                let msg = match pos.and_then(|p| p.position_address) {
+                let msg = match pos.and_then(|p| p.position_nft) {
                     Some(addr) => {
                         if let Ok(mint) = Pubkey::from_str(addr) {
                             match harvest_whirlpool_position(mint).await {
@@ -199,7 +229,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let _ = tx.send(ServiceCommand::SendMessage(msg));
             }
         }
-    }).await;
+    });
 
     // 4. close all
     commander.add_command(&["close", "all"], {
@@ -207,7 +237,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
         move |_params| {
             let tx = Arc::clone(&tx);
             async move {
-                let pool = POOLS[0].clone();
+                let pool = POOL.clone();
                 let mut results = Vec::new();
                 for (idx, pos) in [pool.position_1.as_ref(), pool.position_2.as_ref(), pool.position_3.as_ref()].iter().enumerate() {
                     let msg = match pos.and_then(|p| p.position_nft) {
@@ -230,7 +260,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let _ = tx.send(ServiceCommand::SendMessage(text));
             }
         }
-    }).await;
+    });
 
     // close --usize (конкретная позиция)
     commander.add_command(&["close"], {
@@ -239,7 +269,7 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
             let tx = Arc::clone(&tx);
             async move {
                 let pos_num = params.get(0).and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
-                let pool = POOLS[0].clone();
+                let pool = POOL.clone();
                 let pos = match pos_num {
                     1 => pool.position_1.as_ref(),
                     2 => pool.position_2.as_ref(),
@@ -262,5 +292,99 @@ pub async fn register_commands(commander: &Commander, tx: UnboundedSender<Servic
                 let _ = tx.send(ServiceCommand::SendMessage(msg));
             }
         }
-    }).await;
+    });
+
+    // --- SHORT OPEN: short --uint
+    commander.add_command(&["short"], {
+        let tx = Arc::clone(&tx);
+        move |params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let amount = params.get(0)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if amount <= 0.0 {
+                    let _ = tx.send(ServiceCommand::SendMessage("Укажите сумму в USDT: short --300".into()));
+                    return;
+                }
+                let mut hl = match crate::exchange::hyperliquid::hl::HL::new_from_env().await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(format!("HL init error: {e}")));
+                        return;
+                    }
+                };
+                match hl.open_market_order("SOLUSDT", "Sell", amount, false, 0.0).await {
+                    Ok((cloid, px)) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(format!(
+                            "✅ Short открыт на {:.2} USDT\nOrder ID: {}\nЦена: {:.4}", amount, cloid, px
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(format!("Ошибка открытия шорта: {e}")));
+                    }
+                }
+            }
+        }
+    });
+
+    // --- SHORT CLOSE: short close
+    commander.add_command(&["short", "close"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let mut hl = match crate::exchange::hyperliquid::hl::HL::new_from_env().await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(format!("HL init error: {e}")));
+                        return;
+                    }
+                };
+                // 1. Получить позицию
+                match hl.get_position("SOLUSDT").await {
+                    Ok(Some(pos)) if pos.size > 0.0 => {
+                        // 2. Закрыть её (reduce_only = true, amount_coins = pos.size)
+                        match hl.open_market_order("SOLUSDT", "Short", 0.0, true, pos.size).await {
+                            Ok((cloid, close_px)) => {
+                                // 3. Узнать баланс
+                                match hl.get_balance().await {
+                                    Ok(bal) => {
+                                        let _ = tx.send(ServiceCommand::SendMessage(
+                                            format!(
+                                                "✅ Шорт по SOLUSDT ({:.4} контрактов) успешно закрыт (order {})\nБаланс: ${:.2}",
+                                                pos.size, cloid, bal
+                                            )
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(ServiceCommand::SendMessage(
+                                            format!(
+                                                "✅ Позиция закрыта, но не удалось получить баланс: {e}"
+                                            )
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ServiceCommand::SendMessage(
+                                    format!("Ошибка закрытия позиции: {e}")
+                                ));
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(ServiceCommand::SendMessage("Нет открытого шорта по SOLUSD".into()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            format!("Ошибка получения позиции: {e}")
+                        ));
+                    }
+                }
+            }
+        }
+    });
+
+
 }

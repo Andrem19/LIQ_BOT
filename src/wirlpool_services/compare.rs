@@ -19,7 +19,7 @@ use solana_sdk::pubkey::Pubkey;
 
 use crate::{
     wirlpool_services::net::http_client,
-    params::{POOLS, RPC_URL},
+    params::{POOL, RPC_URL},
 };
 use crate::types::PoolConfig;
 
@@ -120,15 +120,13 @@ async fn stats_onchain(pool: &PoolConfig) -> Result<StatsOnchain> {
 
 /* ─────────────────────────── main ───────────────────────── */
 
-pub async fn compare_pools() -> Result<()> {
+pub async fn compare_pools(initial_amount_usdc: f64) -> Result<()> {
     let mut rows = Vec::new();
 
-    for p in POOLS {
-            match stats_onchain(p).await {
-                Ok(s) => rows.push((p, s)),
-                Err(e) => eprintln!("⚠️  on-chain error {}: {}", p.pool_address, e),
-            }
-        }
+    match stats_onchain(&POOL).await {
+        Ok(s) => rows.push((POOL, s)),
+        Err(e) => eprintln!("⚠️  on-chain error {}: {}", POOL.pool_address, e),
+    }
     if rows.is_empty() {
         return Err(anyhow!("не удалось получить ни одного пула"));
     }
@@ -148,7 +146,7 @@ pub async fn compare_pools() -> Result<()> {
         "#","Pool address","TVL","Fees 24h","Yield %","Profit");
     for (i,(cfg,s)) in rows.iter().enumerate() {
         let y = s.fees_24h.map(|f| f / s.tvl * 100.0);
-        let pr = y.map(|y| cfg.initial_amount_usdc * y / 100.0);
+        let pr = y.map(|y| initial_amount_usdc * y / 100.0);
         println!(
             "{:<4}{:<44}{:>14.2}{:>14}{:>9}{:>10}",
             i+1,

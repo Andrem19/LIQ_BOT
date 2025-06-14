@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 
 # Название директории
-TARGET_DIR = "./src/telegram_service"
+TARGET_DIR = "./"
 
 # Директории, которые полностью исключаются из обхода (и структуры, и кода)
 EXCLUDED_DIRS = {".git", "target", "venv", "vendor", "__pycache__"}
@@ -18,7 +18,7 @@ EXCLUDED_CODE_DIRS = {
     os.path.normpath("graph.dot"),
     os.path.normpath("solana_pools.json"),
     os.path.normpath("src/visualizer"),
-    os.path.normpath("src/exchange"),
+    # os.path.normpath("src/exchange"),
 }
 
 # Пути (файлы или директории), где нужно выводить только сигнатуры (Rust)
@@ -43,6 +43,7 @@ EXCLUDED_FILE_PREFIXES = (
     "code_map",
     "vendor",
     "test",
+    ".cache"
 )
 
 # === Новый список: если он НЕ пуст, обрабатываются только эти файлы/директории ===

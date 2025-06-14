@@ -306,6 +306,53 @@ impl HL {
             .map_err(|e| anyhow!(e))
     }
 
+    pub async fn open_tp(
+        &mut self,
+        symbol: &str,
+        side: &str,
+        position_sz: f64,
+        entry_px: f64,
+        tp_perc: f64,
+    ) -> Result<()> {
+        let coin   = Self::coin(symbol);
+        let px_dec = 2;  // Hyperliquid tick-size = 0.01
+        let sz_dec = self.instrument_info(symbol).await?.sz_decimals;
+
+        // 1. рассчитываем цену TP и trigger, округляем к 0.01
+        let raw_tp = if side.eq_ignore_ascii_case("Buy") {
+            entry_px * (1.0 + tp_perc)
+        } else {
+            entry_px * (1.0 - tp_perc)
+        };
+        let trigger_px = round_to(raw_tp, px_dec);
+        // limit_px обязан совпадать с trigger_px, иначе “invalid price”
+        let limit_px = trigger_px;
+
+        // 2. размер позиции, округлённый по sz_decimals
+        let sz = round_to(position_sz, sz_dec);
+
+        // 3. формируем заявку Take Profit (reduce-only)
+        let order = ClientOrderRequest {
+            asset: coin.into(),
+            is_buy: !side.eq_ignore_ascii_case("Buy"),   // противоположная сторона
+            reduce_only: true,
+            limit_px,
+            sz,
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                trigger_px,
+                is_market: true,
+                tpsl: "tp".into(),
+            }),
+        };
+
+        dbgln!("→ ExchangeClient.order() = {:?}", order);
+        self.exchange
+            .order(order, Some(self.wallet.as_ref()))
+            .await
+            .map(|r| dbgln!("← order resp = {:?}", r))
+            .map_err(|e| anyhow!(e))
+    }
 
     /* --------------------------- helpers ------------------------------- */
 

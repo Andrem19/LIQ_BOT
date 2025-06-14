@@ -350,7 +350,7 @@
 // pub mod params;
 // pub mod wirlpool_services;
 // pub mod telegram_service;
-
+// pub mod exchange;
 
 // use anyhow::{anyhow, Result};
 // use std::{env, str::FromStr, sync::Arc};
@@ -400,9 +400,9 @@
 // #[tokio::main]
 // async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //     let pool = POOLS[0].clone();
-//     // test_open().await?;
+//     test_open().await?;
 //     // test_harvest(pool.clone(), "Cdafq3j7Bo2Zy3MGCqgRAAVHRtSramMfBbFPsvaEMdB5").await?;
-//     test_close("GqoZ9UQ89S5auCgnovkgV5ywemyCVaJnHWEhnuPgqYco").await?;
+//     // test_close("GqoZ9UQ89S5auCgnovkgV5ywemyCVaJnHWEhnuPgqYco").await?;
 //     Ok(())
 // }
 
@@ -415,7 +415,7 @@
 //     let (price_low, price_high) = get_price_bounds(&rpc, &pool).await?;
 //     println!("Price bounds: [{:.6}, {:.6}]", price_low, price_high);
 
-//     let position_mint = open_with_funds_check(price_low, price_high, pool)
+//     let position_mint = open_with_funds_check(price_low, price_high, 20.0, pool)
 //         .await
 //         .map_err(|e| format!("open_whirlpool_position failed: {}", e))?;
 //     println!("✅ Opened position, NFT mint = {}", position_mint);
@@ -476,30 +476,86 @@
 // }
 // src/main.rs (или отдельный файл launcher.rs)
 
+
 mod types;
+pub mod exchange;
 mod params;
 mod wirlpool_services;
 mod telegram_service;
+mod orca_logic;
 
-use std::time::Duration;
-use std::thread;
+use std::{thread, time::Duration};
+use chrono::Local;
+use telegram_service::tl_engine::{start, ServiceCommand};
+use dotenv::dotenv;
 
 #[tokio::main]
 async fn main() {
-    // 1. Запуск Telegram engine (thread + канал для сообщений)
-    let (tx, commander) = telegram_service::engine::start();
+    // 0. Опционально: подгружаем .env (TELEGRAM_API, CHAT_ID, HLSECRET_1, HL_TRADING_ADDRESS и т.д.)
+    dotenv().ok();
 
-    // 2. Регистрация всех команд (Arc-обертка для tx внутри)
-    telegram_service::registry::register_commands(&commander, tx.clone()).await;
+    println!(
+        "[{}][INFO] Запуск LIQ_BOT: инициализация Telegram engine...",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
 
-    // 3. Стартовое уведомление — отправить "Бот запущен" в Telegram
-    let _ = tx.send(telegram_service::engine::ServiceCommand::SendMessage(
-        format!("✅ LIQ_BOT запущен в {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-    ));
+    // 1. Стартуем движок Telegram: он внутри сделает
+    //    - init Commander (Arc<Commander>)
+    //    - register_commands(...)
+    //    - spawn thread, который в цикле читает getUpdates и вызывает exec_command()
+    let (tx, _commander) = start();
 
-    // 4. Можно выполнять основную бизнес-логику приложения (или держать main thread живым)
-    // Если у вас нет других фоновых задач — просто засыпайте.
+    println!(
+        "[{}][INFO] Telegram engine успешно запущен. Команды зарегистрированы.",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+
+    // 2. Шлём стартовое уведомление в чат
+    let startup_msg = format!(
+        "✅ LIQ_BOT успешно запущен в {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    if tx.send(ServiceCommand::SendMessage(startup_msg)).is_ok() {
+        println!(
+            "[{}][DEBUG] Стартовое сообщение отправлено в Telegram.",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+    } else {
+        eprintln!(
+            "[{}][ERROR] Не удалось отправить стартовое сообщение в Telegram.",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+
+    // 3. Основной «таймерный» цикл приложения
+    //    Если вам не нужна дополнительная логика, можно просто спать.
+    println!(
+        "[{}][INFO] LIQ_BOT полностью запущен. Ожидание команд в Telegram…",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
     loop {
-        thread::sleep(Duration::from_secs(3600));
+        thread::sleep(Duration::from_secs(60));
+        println!(
+            "[{}][DEBUG] LIQ_BOT alive…",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
     }
 }
+
+// pub mod params;
+// pub mod exchange;
+// pub mod types;
+// pub mod orca_logic;
+
+// use params::{PCT_LIST, WEIGHTS, TOTAL_USDC};
+
+// fn main() {
+//     let price = 160.0;
+
+//     let bounds = orca_logic::helpers::calc_bound_prices_struct(price, &PCT_LIST);
+//     let allocs = orca_logic::helpers::calc_range_allocation_struct(price, &bounds, &WEIGHTS, TOTAL_USDC);
+
+//     for a in allocs {
+//         println!("{:?}", a);
+//     }
+// }
