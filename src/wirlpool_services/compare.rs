@@ -18,9 +18,10 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::{
-    net::http_client,
-    params::{PoolConfig, POOLS, RPC_URL},
+    wirlpool_services::net::http_client,
+    params::{POOLS, RPC_URL},
 };
+use crate::types::PoolConfig;
 
 const Q64: f64 = 1.8446744073709552e19;
 
@@ -85,11 +86,11 @@ async fn stats_onchain(pool: &PoolConfig) -> Result<StatsOnchain> {
     let bal_a = rpc.get_token_account_balance(&whirl.token_vault_a)?.amount.parse::<u128>()?;
     let bal_b = rpc.get_token_account_balance(&whirl.token_vault_b)?.amount.parse::<u128>()?;
 
-    let price_a = price_jup(pool.mint_A).await?;
-    let price_b = price_jup(pool.mint_B).await?;
+    let price_a = price_jup(pool.mint_a).await?;
+    let price_b = price_jup(pool.mint_b).await?;
 
-    let tvl = bal_a as f64 / 10f64.powi(pool.decimal_A as i32) * price_a
-        + bal_b as f64 / 10f64.powi(pool.decimal_B as i32) * price_b;
+    let tvl = bal_a as f64 / 10f64.powi(pool.decimal_a as i32) * price_a
+        + bal_b as f64 / 10f64.powi(pool.decimal_b as i32) * price_b;
 
     /* ------------ fee delta ------------ */
     let fee_snap = FeeSnapshot {

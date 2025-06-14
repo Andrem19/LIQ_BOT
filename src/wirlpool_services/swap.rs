@@ -20,8 +20,9 @@ use solana_sdk::{
 
 use spl_associated_token_account::get_associated_token_address;
 
-use crate::net::http_client;
-use crate::params::{PoolConfig, KEYPAIR_FILENAME, RPC_URL};
+use crate::wirlpool_services::net::http_client;
+use crate::params::{KEYPAIR_FILENAME, RPC_URL};
+use crate::types::PoolConfig;
 
 /// Итог свопа
 pub struct SwapResult {
@@ -106,7 +107,7 @@ pub async fn execute_swap(
 
     // 3) Quote
     let quote_url = format!(
-        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
+        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50&onlyDirectRoutes=true",
         in_mint, out_mint, amount_in_atoms
     );
     let resp = http.get(&quote_url).send().await?;
@@ -146,7 +147,18 @@ pub async fn execute_swap(
     let tx_bytes = b64.decode(swap_tx_b64)?;
     let tx: Transaction = deserialize(&tx_bytes)
         .map_err(|e| anyhow!("bincode deserialize error: {}", e))?;
-    send_signed_tx(&rpc, tx, &payer)?;
+    let send_res = send_signed_tx(&rpc, tx, &payer);
+    if let Err(err) = send_res {
+        let msg = err.to_string();
+        // если это именно наша «виртуальная» ошибка от Jupiter wrap/close
+        if msg.contains("could not find account") {
+            // просто логируем и продолжаем дальше — SOL у нас уже на балансе
+            eprintln!("⚠️  warning: Jupiter wrapper error ignored: {}", msg);
+        } else {
+            // а остальные — прокидываем дальше
+            return Err(err);
+        }
+    }
 
     // 6) Финальные балансы
     let ata_in  = get_associated_token_address(&wallet, &in_mint);

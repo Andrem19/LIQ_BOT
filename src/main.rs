@@ -147,135 +147,135 @@
 // }
 // open_position.rs -----------------------------------------------------------
 
-mod params;
+// mod params;
+// mod wirlpool;
+// use anyhow::{anyhow, Result};
+// use std::{sync::Arc, str::FromStr, time::Duration};
 
-use anyhow::{anyhow, Result};
-use std::{sync::Arc, str::FromStr, time::Duration};
+// use solana_client::{
+//     nonblocking::rpc_client::RpcClient,
+//     rpc_config::RpcSendTransactionConfig,
+// };
+// use solana_sdk::{
+//     commitment_config::CommitmentConfig,
+//     hash::Hash,
+//     instruction::Instruction,
+//     message::Message,
+//     pubkey::Pubkey,
+//     program_pack::Pack,
+//     signature::{Keypair, Signature, Signer, read_keypair_file},
+//     system_instruction,
+//     transaction::Transaction,
+// };
+// use spl_token::state::Mint;
 
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::RpcSendTransactionConfig,
-};
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    hash::Hash,
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    program_pack::Pack,
-    signature::{Keypair, Signature, Signer, read_keypair_file},
-    system_instruction,
-    transaction::Transaction,
-};
-use spl_token::state::Mint;
+// use orca_whirlpools_client::Whirlpool;
+// use orca_whirlpools::{
+//     open_position_instructions,
+//     set_whirlpools_config_address,
+//     IncreaseLiquidityParam, WhirlpoolsConfigInput,
+// };
+// use orca_whirlpools_core::{sqrt_price_to_price, U128};
 
-use orca_whirlpools_client::Whirlpool;
-use orca_whirlpools::{
-    open_position_instructions,
-    set_whirlpools_config_address,
-    IncreaseLiquidityParam, WhirlpoolsConfigInput,
-};
-use orca_whirlpools_core::{sqrt_price_to_price, U128};
+// /// ───── параметры, которые вы чаще всего меняете ─────
+// const RPC_URL: &str           = "https://api.mainnet-beta.solana.com";
+// const WALLET_PATH: &str       = params::KEYPAIR_FILENAME;          // ваш keypair
+// const WHIRLPOOL: &str         = "Esvfxt3jMDdtTZqLF1fqRhDjzM8Bpr7fZxJMrK69PB7e"; // WSOL/USDC
+// const PCT_RANGE: f64          = 0.01;          // ±1 %
+// const DEPOSIT_SOL: u64        = 10_000_000;    // 0.01 SOL
+// const SLIPPAGE_BPS: u16       = 5_000;         // 50 %
+// /// ──────────────────────────────────────────────────────
 
-/// ───── параметры, которые вы чаще всего меняете ─────
-const RPC_URL: &str           = "https://api.mainnet-beta.solana.com";
-const WALLET_PATH: &str       = params::KEYPAIR_FILENAME;          // ваш keypair
-const WHIRLPOOL: &str         = "Esvfxt3jMDdtTZqLF1fqRhDjzM8Bpr7fZxJMrK69PB7e"; // WSOL/USDC
-const PCT_RANGE: f64          = 0.01;          // ±1 %
-const DEPOSIT_SOL: u64        = 10_000_000;    // 0.01 SOL
-const SLIPPAGE_BPS: u16       = 5_000;         // 50 %
-/// ──────────────────────────────────────────────────────
+// #[tokio::main]
+// async fn main() -> Result<()> {
+//     /* 1. RPC-клиент и конфиг Whirlpool-SDK */
+//     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
+//     .map_err(|e| anyhow!("set_whirlpools_config_address: {}", e))?;
+//     let rpc = Arc::new(RpcClient::new_with_commitment(
+//         RPC_URL.to_string(),
+//         CommitmentConfig::confirmed(),
+//     ));
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    /* 1. RPC-клиент и конфиг Whirlpool-SDK */
-    set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-    .map_err(|e| anyhow!("set_whirlpools_config_address: {}", e))?;
-    let rpc = Arc::new(RpcClient::new_with_commitment(
-        RPC_URL.to_string(),
-        CommitmentConfig::confirmed(),
-    ));
+//     /* 2. Wallet */
+//     let wallet = read_keypair_file(WALLET_PATH)
+//         .map_err(|e| anyhow!("read_keypair_file: {e}"))?;
+//     let wallet_pk = wallet.pubkey();
 
-    /* 2. Wallet */
-    let wallet = read_keypair_file(WALLET_PATH)
-        .map_err(|e| anyhow!("read_keypair_file: {e}"))?;
-    let wallet_pk = wallet.pubkey();
+//     /* 3. Читаем аккаунт пула и decimals токенов */
+//     let whirl_pk = Pubkey::from_str(WHIRLPOOL)?;
+//     let whirl_acct = rpc.get_account(&whirl_pk).await?;
+//     let whirl = Whirlpool::from_bytes(&whirl_acct.data)?;
+//     let dec_a = Mint::unpack(&rpc.get_account(&whirl.token_mint_a).await?.data)?.decimals;
+//     let dec_b = Mint::unpack(&rpc.get_account(&whirl.token_mint_b).await?.data)?.decimals;
 
-    /* 3. Читаем аккаунт пула и decimals токенов */
-    let whirl_pk = Pubkey::from_str(WHIRLPOOL)?;
-    let whirl_acct = rpc.get_account(&whirl_pk).await?;
-    let whirl = Whirlpool::from_bytes(&whirl_acct.data)?;
-    let dec_a = Mint::unpack(&rpc.get_account(&whirl.token_mint_a).await?.data)?.decimals;
-    let dec_b = Mint::unpack(&rpc.get_account(&whirl.token_mint_b).await?.data)?.decimals;
+//     /* 4. Границы цен */
+//     let price_now  = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+//     let price_low  = price_now * (1.0 - PCT_RANGE);
+//     let price_high = price_now * (1.0 + PCT_RANGE);
 
-    /* 4. Границы цен */
-    let price_now  = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
-    let price_low  = price_now * (1.0 - PCT_RANGE);
-    let price_high = price_now * (1.0 + PCT_RANGE);
+//     /* 5. Запрашиваем инструкции SDK (TickArray+Open+Increase) */
+//     let quote = open_position_instructions(
+//         &rpc,
+//         whirl_pk,
+//         price_low,
+//         price_high,
+//         IncreaseLiquidityParam::TokenA(DEPOSIT_SOL),
+//         Some(SLIPPAGE_BPS),
+//         Some(wallet_pk),
+//     )
+//     .await
+//     .map_err(|e| anyhow!("open_position_instructions: {}", e))?;
 
-    /* 5. Запрашиваем инструкции SDK (TickArray+Open+Increase) */
-    let quote = open_position_instructions(
-        &rpc,
-        whirl_pk,
-        price_low,
-        price_high,
-        IncreaseLiquidityParam::TokenA(DEPOSIT_SOL),
-        Some(SLIPPAGE_BPS),
-        Some(wallet_pk),
-    )
-    .await
-    .map_err(|e| anyhow!("open_position_instructions: {}", e))?;
+//     /* 6. Собираем все keypair-подписанты */
+//     let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + quote.additional_signers.len());
+//     signers.push(&wallet);
+//     signers.extend(quote.additional_signers.iter());
 
-    /* 6. Собираем все keypair-подписанты */
-    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + quote.additional_signers.len());
-    signers.push(&wallet);
-    signers.extend(quote.additional_signers.iter());
+//     /* 7. Добавляем Compute-Budget (400 000 CU) перед набором SDK */
+//     let mut ixs: Vec<Instruction> = vec![
+//         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+//     ];
+//     ixs.extend(quote.instructions);
 
-    /* 7. Добавляем Compute-Budget (400 000 CU) перед набором SDK */
-    let mut ixs: Vec<Instruction> = vec![
-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000),
-    ];
-    ixs.extend(quote.instructions);
+//     /* 8. Формируем и подписываем Transaction */
+//     let recent: Hash = rpc.get_latest_blockhash().await?;
+//     let message = Message::new(&ixs, Some(&wallet_pk));
+//     let mut tx = Transaction::new_unsigned(message);
+//     tx.try_sign(&signers, recent)?;
 
-    /* 8. Формируем и подписываем Transaction */
-    let recent: Hash = rpc.get_latest_blockhash().await?;
-    let message = Message::new(&ixs, Some(&wallet_pk));
-    let mut tx = Transaction::new_unsigned(message);
-    tx.try_sign(&signers, recent)?;
+//     /* 9. Отправляем raw-tx и ждём подтверждения */
+//     let sig: Signature = rpc
+//         .send_transaction_with_config(
+//             &tx,
+//             RpcSendTransactionConfig {
+//                 skip_preflight: false,
+//                 preflight_commitment: Some(CommitmentConfig::processed().commitment),
+//                 ..RpcSendTransactionConfig::default()
+//             },
+//         )
+//         .await?;
 
-    /* 9. Отправляем raw-tx и ждём подтверждения */
-    let sig: Signature = rpc
-        .send_transaction_with_config(
-            &tx,
-            RpcSendTransactionConfig {
-                skip_preflight: false,
-                preflight_commitment: Some(CommitmentConfig::processed().commitment),
-                ..RpcSendTransactionConfig::default()
-            },
-        )
-        .await?;
+//     println!("⏳ tx sent {sig} — waiting for confirmation…");
 
-    println!("⏳ tx sent {sig} — waiting for confirmation…");
-
-    // простой поллинг: 40 сек × 1 сек
-    for _ in 0..40 {
-        if let Some(status_res) = rpc.get_signature_status(&sig).await? {
-            // транзакция найдена в стейтусах — разбираем результат
-            match status_res {
-                Ok(()) => {
-                    println!("✅ позиция создана! tx = {}", sig);
-                    return Ok(());
-                }
-                Err(err) => {
-                    return Err(anyhow!("Transaction failed: {:?}", err));
-                }
-            }
-        }
-        // ещё не в стейтусах — ждём секунду
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err(anyhow!("Timeout: transaction {sig} not confirmed within 40 s"))
-}
+//     // простой поллинг: 40 сек × 1 сек
+//     for _ in 0..40 {
+//         if let Some(status_res) = rpc.get_signature_status(&sig).await? {
+//             // транзакция найдена в стейтусах — разбираем результат
+//             match status_res {
+//                 Ok(()) => {
+//                     println!("✅ позиция создана! tx = {}", sig);
+//                     return Ok(());
+//                 }
+//                 Err(err) => {
+//                     return Err(anyhow!("Transaction failed: {:?}", err));
+//                 }
+//             }
+//         }
+//         // ещё не в стейтусах — ждём секунду
+//         tokio::time::sleep(Duration::from_secs(1)).await;
+//     }
+//     Err(anyhow!("Timeout: transaction {sig} not confirmed within 40 s"))
+// }
 
 
 // pub mod params;
@@ -343,3 +343,163 @@ async fn main() -> Result<()> {
 //     println!("Close position transaction sent: {}", signature);
 //     Ok(())
 // }
+// src/main.rs
+// src/main.rs
+
+// pub mod types;
+// pub mod params;
+// pub mod wirlpool_services;
+// pub mod telegram_service;
+
+
+// use anyhow::{anyhow, Result};
+// use std::{env, str::FromStr, sync::Arc};
+// use solana_client::nonblocking::rpc_client::RpcClient;
+// use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
+// use spl_token::state::Mint;
+// use spl_token::solana_program::program_pack::Pack;
+// use orca_whirlpools_client::Whirlpool;
+// use orca_whirlpools_core::{U128, sqrt_price_to_price};
+
+// use crate::wirlpool_services::wirlpool::{open_with_funds_check, open_whirlpool_position, close_whirlpool_position, harvest_whirlpool_position, summarize_harvest_fees, HarvestSummary};
+// use crate::params::POOLS;
+// use crate::types::PoolConfig;
+
+// /// Ширина диапазона ±1%
+// const PCT_RANGE: f64 = 0.01;
+
+// /// Инициализирует RPC-клиент из .env-переменных
+// fn init_rpc() -> Arc<RpcClient> {
+//     let url = env::var("HELIUS_HTTP")
+//         .or_else(|_| env::var("QUICKNODE_HTTP"))
+//         .or_else(|_| env::var("ANKR_HTTP"))
+//         .or_else(|_| env::var("CHAINSTACK_HTTP"))
+//         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+//     Arc::new(RpcClient::new_with_commitment(url, CommitmentConfig::confirmed()))
+// }
+
+// /// Асинхронно получает текущую цену и диапазон [low, high] для пула
+// async fn get_price_bounds(
+//     rpc: &Arc<RpcClient>,
+//     pool: &PoolConfig,
+// ) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+//     let whirl_pk = Pubkey::from_str(pool.pool_address)?;
+//     let acct = rpc.get_account(&whirl_pk).await?;
+//     let whirl = Whirlpool::from_bytes(&acct.data)?;
+//     // читаем decimals A и B
+//     let mint_a_acct = rpc.get_account(&whirl.token_mint_a).await?;
+//     let dec_a = Mint::unpack(&mint_a_acct.data)?.decimals;
+//     let mint_b_acct = rpc.get_account(&whirl.token_mint_b).await?;
+//     let dec_b = Mint::unpack(&mint_b_acct.data)?.decimals;
+//     // вычисляем цену и диапазон
+//     let price_now = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+//     Ok((price_now * (1.0 - PCT_RANGE), price_now * (1.0 + PCT_RANGE)))
+// }
+
+// /// Точка входа. Раскомментируйте нужный тест.
+// #[tokio::main]
+// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//     let pool = POOLS[0].clone();
+//     // test_open().await?;
+//     // test_harvest(pool.clone(), "Cdafq3j7Bo2Zy3MGCqgRAAVHRtSramMfBbFPsvaEMdB5").await?;
+//     test_close("GqoZ9UQ89S5auCgnovkgV5ywemyCVaJnHWEhnuPgqYco").await?;
+//     Ok(())
+// }
+
+// /// Тест открытия позиции
+// async fn test_open() -> Result<(), Box<dyn std::error::Error>> {
+//     let rpc = init_rpc();
+//     let pool = POOLS[0].clone();
+//     println!("=== Testing OPEN on pool {} ({}) ===", pool.name, pool.pool_address);
+
+//     let (price_low, price_high) = get_price_bounds(&rpc, &pool).await?;
+//     println!("Price bounds: [{:.6}, {:.6}]", price_low, price_high);
+
+//     let position_mint = open_with_funds_check(price_low, price_high, pool)
+//         .await
+//         .map_err(|e| format!("open_whirlpool_position failed: {}", e))?;
+//     println!("✅ Opened position, NFT mint = {}", position_mint);
+//     Ok(())
+// }
+
+// /// Тест сбора комиссий (harvest)
+// async fn test_harvest(pool: PoolConfig, mint_str: &str) -> Result<()> {
+//     let position_mint = Pubkey::from_str(mint_str)?;
+//     println!(
+//         "=== Testing HARVEST on position {} for pool {} ({}) ===",
+//         position_mint, pool.name, pool.pool_address
+//     );
+
+//     // 1) Получаем сырые минимальные единицы
+//     let fees = harvest_whirlpool_position(position_mint)
+//         .await
+//         .map_err(|e| anyhow::anyhow!("harvest_whirlpool_position failed: {}", e))?;
+
+//     // 2) Конвертируем в читаемые суммы и считаем USD-стоимость
+//     let summary: HarvestSummary = summarize_harvest_fees(&pool, &fees)
+//         .await
+//         .map_err(|e| anyhow::anyhow!("summarize_harvest_fees failed: {}", e))?;
+
+//     // 3) Печатаем результаты
+//     println!("✅ Harvested fees:");
+//     println!(
+//         "   • {:.6} {} (raw = {})",
+//         summary.amount_a, pool.mint_a, fees.fee_owed_a
+//     );
+//     println!(
+//         "   • {:.6} {} (raw = {})",
+//         summary.amount_b, pool.mint_b, fees.fee_owed_b
+//     );
+//     println!(
+//         "   • Price of {} → {} = {:.6}",
+//         pool.mint_a, pool.mint_b, summary.price_a_in_usd
+//     );
+//     println!(
+//         "   • Total value = {:.6} {}",
+//         summary.total_usd, pool.mint_b
+//     );
+
+//     Ok(())
+// }
+
+
+// /// Тест закрытия позиции
+// async fn test_close(mint_str: &str) -> Result<(), Box<dyn std::error::Error>> {
+//     let position_mint = Pubkey::from_str(mint_str)?;
+//     println!("=== Testing CLOSE on position {} ===", position_mint);
+
+//     close_whirlpool_position(position_mint)
+//         .await
+//         .map_err(|e| format!("close_whirlpool_position failed: {}", e))?;
+//     println!("✅ Closed position {}", position_mint);
+//     Ok(())
+// }
+// src/main.rs (или отдельный файл launcher.rs)
+
+mod types;
+mod params;
+mod wirlpool_services;
+mod telegram_service;
+
+use std::time::Duration;
+use std::thread;
+
+#[tokio::main]
+async fn main() {
+    // 1. Запуск Telegram engine (thread + канал для сообщений)
+    let (tx, commander) = telegram_service::engine::start();
+
+    // 2. Регистрация всех команд (Arc-обертка для tx внутри)
+    telegram_service::registry::register_commands(&commander, tx.clone()).await;
+
+    // 3. Стартовое уведомление — отправить "Бот запущен" в Telegram
+    let _ = tx.send(telegram_service::engine::ServiceCommand::SendMessage(
+        format!("✅ LIQ_BOT запущен в {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+    ));
+
+    // 4. Можно выполнять основную бизнес-логику приложения (или держать main thread живым)
+    // Если у вас нет других фоновых задач — просто засыпайте.
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
+}

@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 
 # Название директории
-TARGET_DIR = "./"
+TARGET_DIR = "./src/telegram_service"
 
 # Директории, которые полностью исключаются из обхода (и структуры, и кода)
 EXCLUDED_DIRS = {".git", "target", "venv", "vendor", "__pycache__"}

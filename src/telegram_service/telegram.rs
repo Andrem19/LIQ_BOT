@@ -1,12 +1,11 @@
-// src/telegram.rs
+// src/telegram_service/telegram.rs
 
 use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::json;
 use tracing::debug;
-use crate::net::http_client;
+use crate::wirlpool_services::net::http_client;
 
-/// Минимальная обёртка над Telegram Bot API
 #[derive(Clone)]
 pub struct Telegram {
     client: Client,
@@ -22,7 +21,22 @@ impl Telegram {
         Telegram { client, token, chat_id }
     }
 
-    /// Просто отправить текстовое сообщение
+    /// Позволяет Engine-у выполнять getUpdates и т.п.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Токен нужен для построения URL при getUpdates
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Идентификатор чата
+    pub fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// Отправка простого текста
     pub async fn send(&self, text: &str) -> Result<()> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let resp = self.client
@@ -39,7 +53,6 @@ impl Telegram {
         Ok(())
     }
 
-    /// Отправить подробный отчёт по пулу
     #[allow(clippy::too_many_arguments)]
     pub async fn send_pool_report(
         &self,
@@ -66,7 +79,6 @@ impl Telegram {
             balance_wsol as f64 / 1e9,
             profit_usdc,
         );
-        // Можно включить parse_mode = "Markdown" при необходимости
         self.send(&text).await
     }
 }

@@ -17,6 +17,7 @@ use solana_sdk::signature::Signer;
 use orca_whirlpools_client::{
     get_tick_array_address, Position, UpdateFeesAndRewardsBuilder, Whirlpool,
 };
+use crate::types::PoolConfig;
 use crate::{
     params::{KEYPAIR_FILENAME, RPC_URL},
     types::PoolPositionInfo,
@@ -51,7 +52,7 @@ fn compute_amounts(liquidity: f64, sqrt_p: f64, sqrt_l: f64, sqrt_u: f64) -> (f6
 /// Получить и распечатать всю информацию по открытой позиции.
 ///
 /// Принимает конфиг пула и возвращает struct с теми же полями, что выводятся в консоль.
-pub async fn fetch_pool_position_info(pool_cfg: &crate::params::PoolConfig) -> Result<PoolPositionInfo> {
+pub async fn fetch_pool_position_info(pool_cfg: &PoolConfig, position_address: Option<&str>) -> Result<PoolPositionInfo> {
     // --- 1) Читать keypair и RPC/HTTP клиенты
     let keypair = read_keypair_file(KEYPAIR_FILENAME)
         .map_err(|e| anyhow!("Не удалось прочитать keypair: {}", e))?;
@@ -67,7 +68,7 @@ pub async fn fetch_pool_position_info(pool_cfg: &crate::params::PoolConfig) -> R
     let whirl: Whirlpool = Whirlpool::from_bytes(&whirl_acc.data)?;
 
     // --- 3) Всегда получаем текущий price через Raydium API
-    let url = format!("https://api-v3.raydium.io/mint/price?mints={}", pool_cfg.mint_A);
+    let url = format!("https://api-v3.raydium.io/mint/price?mints={}", pool_cfg.mint_a);
     let resp = http
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -89,7 +90,7 @@ pub async fn fetch_pool_position_info(pool_cfg: &crate::params::PoolConfig) -> R
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow!("Raydium API: missing data field"))?;
     let price_str = data
-        .get(pool_cfg.mint_A)
+        .get(pool_cfg.mint_a)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Raydium API: missing mint price"))?;
     let current_price: f64 = price_str
@@ -113,7 +114,7 @@ pub async fn fetch_pool_position_info(pool_cfg: &crate::params::PoolConfig) -> R
     let mut pct_up = 0.0;
 
     // --- 5) Если у нас задан address позиции, пытаемся её обновить
-    if let Some(addr_str) = pool_cfg.position_address {
+    if let Some(addr_str) = position_address {
         if let Ok(pos_addr) = Pubkey::from_str(addr_str) {
             if let Ok(pos_acc) = rpc.get_account(&pos_addr) {
                 // --- 5.1) Считать старую позицию и посчитать накопленные fees
@@ -141,8 +142,8 @@ pub async fn fetch_pool_position_info(pool_cfg: &crate::params::PoolConfig) -> R
                 let pos2: Position = Position::from_bytes(&pos2_acc.data)?;
 
                 // --- 5.2) Fee owing в токенах и в USD
-                let dec_a = pool_cfg.decimal_A as i32;
-                let dec_b = pool_cfg.decimal_B as i32;
+                let dec_a = pool_cfg.decimal_a as i32;
+                let dec_b = pool_cfg.decimal_b as i32;
                 pending_a = pos2.fee_owed_a as f64 / 10f64.powi(dec_a);
                 pending_b = pos2.fee_owed_b as f64 / 10f64.powi(dec_b);
                 pending_a_usd = pending_a * current_price;
