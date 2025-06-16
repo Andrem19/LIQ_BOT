@@ -5,7 +5,8 @@ use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_config::RpcSendTransactionConfig,
 };
-
+use anyhow::Context;
+use tokio::time::sleep;
 use spl_associated_token_account::get_associated_token_address;
 use spl_token::solana_program::program_pack::Pack;
 use solana_sdk::{
@@ -17,6 +18,11 @@ use solana_sdk::{
     signature::{read_keypair_file, Keypair, Signer},
     transaction::Transaction,
 };
+use orca_whirlpools::{
+    fetch_positions_for_owner, 
+    fetch_positions_in_whirlpool,
+    PositionOrBundle,
+};
 use solana_sdk::system_instruction;
 use spl_associated_token_account::instruction::create_associated_token_account;
 use spl_token::instruction::sync_native;
@@ -24,7 +30,7 @@ use orca_whirlpools::OpenPositionInstruction;
 use orca_whirlpools_core::IncreaseLiquidityQuote;
 use crate::wirlpool_services::swap::SwapResult;
 use spl_token::state::Mint;
-use orca_whirlpools_client::Whirlpool;
+use orca_whirlpools_client::{Whirlpool,Position, DecodedAccount};
 use orca_whirlpools::{
     close_position_instructions, harvest_position_instructions, open_position_instructions,
     set_whirlpools_config_address, HarvestPositionInstruction, IncreaseLiquidityParam,
@@ -33,7 +39,7 @@ use orca_whirlpools::{
 use orca_whirlpools_core::{CollectFeesQuote, U128, sqrt_price_to_price};
 use crate::wirlpool_services::swap::execute_swap;
 use crate::params;
-use crate::types::PoolConfig;
+use crate::types::{PoolConfig, OpenPositionResult};
 use orca_whirlpools_client::ID;
 
 /// Вспомогательная функция для единообразного маппинга ошибок.
@@ -101,65 +107,6 @@ mod utils {
         }
         Err(anyhow!("Timeout: tx {} not confirmed within 40s", sig))
     }
-}
-
-/// Открывает позицию и возвращает `position_mint`.
-pub async fn open_whirlpool_position(
-    price_low: f64,
-    price_high: f64,
-    initial_amount_usdc: f64,
-    pool: PoolConfig,
-) -> Result<Pubkey> {
-    // SDK
-    set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-        .map_err(op("set_whirlpools_config_address"))?;
-    let rpc = utils::init_rpc();
-    let wallet = utils::load_wallet()?;
-    let wallet_pk = wallet.pubkey();
-
-    // Пул
-    let whirl_pk = Pubkey::from_str(pool.pool_address)
-        .map_err(op("parse pool_address"))?;
-    let acct = rpc
-        .get_account(&whirl_pk)
-        .await
-        .map_err(op("get_account pool"))?;
-    let whirl = Whirlpool::from_bytes(&acct.data).map_err(op("Whirlpool::from_bytes"))?;
-
-    // Decimals & deposit
-    let dec_b = {
-        let mb = rpc
-            .get_account(&whirl.token_mint_b)
-            .await
-            .map_err(op("get_account mint_b"))?;
-        Mint::unpack(&mb.data).map_err(op("Mint::unpack mint_b"))?.decimals
-    };
-    let deposit = (initial_amount_usdc * 10f64.powi(dec_b as i32)).round() as u64;
-
-    // Инструкции
-    let quote = open_position_instructions(
-        &rpc,
-        whirl_pk,
-        price_low,
-        price_high,
-        IncreaseLiquidityParam::TokenB(deposit),
-        None,
-        Some(wallet_pk),
-    )
-    .await
-    .map_err(op("open_position_instructions"))?;
-
-    // Подписанты
-    let mut signers = Vec::with_capacity(1 + quote.additional_signers.len());
-    signers.push(&wallet);
-    for kp in &quote.additional_signers {
-        signers.push(kp);
-    }
-
-    utils::send_and_confirm(rpc, quote.instructions, &signers)
-        .await
-        .map_err(op("send_and_confirm"))?;
-    Ok(quote.position_mint)
 }
 
 /// Закрывает позицию; возвращает `()` при успехе.
@@ -272,32 +219,57 @@ pub async fn summarize_harvest_fees(
 }
 
 
-
-
-
-
 pub async fn open_with_funds_check(
-    price_low:  f64,
+    price_low: f64,
     price_high: f64,
     initial_amount_usdc: f64,
-    pool:       PoolConfig,
-) -> Result<Pubkey> {
-    // 1) RPC, кошелёк, SDK
-    let rpc       = utils::init_rpc();
-    let wallet    = utils::load_wallet()?;
+    pool: PoolConfig,
+) -> Result<OpenPositionResult> {
+    // 1) Инициализация RPC, кошелька и SDK
+    let rpc      = utils::init_rpc();
+    let wallet   = utils::load_wallet()?;
     let wallet_pk = wallet.pubkey();
-    log::debug!("DEBUG: wallet = {}", wallet_pk);
-
+    log::debug!("debug: wallet = {}", wallet_pk);
     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
         .map_err(|e| anyhow!("SDK config failed: {}", e))?;
-    log::debug!("DEBUG: whirlpools sdk → Mainnet");
+    log::debug!("debug: whirlpools sdk → Mainnet");
 
-    // 2) Берём из SDK готовые инструкции и квоту
-    let dec_b      = pool.decimal_b as i32;
-    let deposit_b  = (initial_amount_usdc * 10f64.powi(dec_b)).round() as u64;
-    log::debug!("DEBUG: deposit_b_atoms = {}", deposit_b);
-
+    // 2) Загружаем пул и считаем текущую цену + депозиты в атомах
     let whirl_pk = Pubkey::from_str(pool.pool_address)?;
+    let acct     = rpc.get_account(&whirl_pk).await?;
+    let whirl    = Whirlpool::from_bytes(&acct.data)?;
+
+    let dec_a = pool.decimal_a as i32;
+    let dec_b = pool.decimal_b as i32;
+
+    let price_sol_in_usdc = sqrt_price_to_price(
+        U128::from(whirl.sqrt_price),
+        dec_a as u8,
+        dec_b as u8,
+    );
+    if price_sol_in_usdc <= 0.0 {
+        return Err(anyhow!("Invalid pool price: {}", price_sol_in_usdc));
+    }
+    log::debug!("debug: price SOL→USDC = {:.6}", price_sol_in_usdc);
+    let slippage_bps = 100;
+    let deposit_b = ((initial_amount_usdc * 10f64.powi(dec_b) as f64) * (1.0 + slippage_bps as f64 / 10_000.0))
+    .round() as u64;
+    let deposit_a = ((initial_amount_usdc / price_sol_in_usdc) * 10f64.powi(dec_a)).round() as u64;
+    log::debug!(
+        "debug: deposit_a_atoms = {}, deposit_b_atoms = {}",
+        deposit_a, deposit_b
+    );
+
+    // Выбираем, какой токен вносить
+    let liquidity_param = if price_low > price_sol_in_usdc {
+        IncreaseLiquidityParam::TokenA(deposit_a)
+    } else if price_high < price_sol_in_usdc {
+        IncreaseLiquidityParam::TokenB(deposit_b)
+    } else {
+        IncreaseLiquidityParam::TokenB(deposit_b)
+    };
+
+    // Берём инструкции из SDK
     let OpenPositionInstruction {
         position_mint,
         quote: IncreaseLiquidityQuote { token_max_a, token_max_b, .. },
@@ -309,15 +281,14 @@ pub async fn open_with_funds_check(
             whirl_pk,
             price_low,
             price_high,
-            IncreaseLiquidityParam::TokenB(deposit_b),
+            liquidity_param,
             None,
             Some(wallet_pk),
         )
         .await
         .map_err(|e| anyhow!("open_position_instructions failed: {}", e))?;
-
     log::debug!(
-        "DEBUG: quote.token_max_a = {}, token_max_b = {}",
+        "debug: quote.token_max_a = {}, token_max_b = {}",
         token_max_a, token_max_b
     );
 
@@ -387,13 +358,30 @@ pub async fn open_with_funds_check(
         let miss = need_usdc - usdc_avail;
         let cost = miss / price_sol_in_usdc;
         log::debug!("DEBUG: swap SOL→USDC: need {:.6} USDC costs {:.6} SOL", miss, cost);
+
         if sol_avail + 1e-9 < cost {
-            return Err(anyhow!("Недостаточно SOL для свапа: need {:.6}, have {:.6}", cost, sol_avail));
+            return Err(anyhow!(
+                "Недостаточно SOL для свапа: need {:.6}, have {:.6}",
+                cost,
+                sol_avail
+            ));
         }
+
+        // пытаться свапнуть, игнорируя "could not find account"
         let SwapResult { balance_sell: new_sol, balance_buy: new_usdc } =
-            execute_swap(&pool, pool.mint_a, pool.mint_b, miss)
-            .await
-            .map_err(|e| anyhow!("swap SOL→USDC failed: {}", e))?;
+            match execute_swap(&pool, pool.mint_a, pool.mint_b, miss).await {
+                Ok(sr) => sr,
+                Err(e) if e.to_string().contains("could not find account") => {
+                    log::debug!("⚠️  Jupiter «close account» error ignored: {}", e);
+                    // предполагаем, что SOL потратили cost, а USDC получили miss
+                    SwapResult {
+                        balance_sell: sol_avail - cost,
+                        balance_buy:  usdc_avail + miss,
+                    }
+                }
+                Err(e) => return Err(anyhow!("swap SOL→USDC failed: {}", e)),
+            };
+
         sol_avail  = new_sol;
         usdc_avail = new_usdc;
         log::debug!("DEBUG: after swap → SOL = {:.6}, USDC = {:.6}", sol_avail, usdc_avail);
@@ -405,6 +393,8 @@ pub async fn open_with_funds_check(
 
     // 10) Всё готово — шлём ровно те же инструкции из SDK
     log::debug!("DEBUG: sending SDK instructions…");
+    let amount_wsol = token_max_a as f64 / 10f64.powi(dec_a);
+    let amount_usdc = token_max_b as f64 / 10f64.powi(dec_b);
     let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + additional_signers.len());
     signers.push(&wallet);
     for kp in &additional_signers { signers.push(kp); }
@@ -414,5 +404,98 @@ pub async fn open_with_funds_check(
         .map_err(|e| anyhow!("send_and_confirm failed: {}", e))?;
 
     log::debug!("✅ Position opened, mint = {}", position_mint);
-    Ok(position_mint)
+    Ok(OpenPositionResult {
+        position_mint,
+        amount_wsol,
+        amount_usdc,
+    })
+}
+
+pub async fn list_positions_for_owner() -> Result<Vec<PositionOrBundle>> {
+    // 1) Настраиваем SDK на Mainnet
+    set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
+        .map_err(|e| anyhow!("SDK config failed: {}", e))?;
+
+    // 2) RPC и адрес владельца
+    let rpc = utils::init_rpc();
+    let wallet = utils::load_wallet()?;
+    let owner = wallet.pubkey();
+
+    // 3) Фетчим позиции
+    let positions = fetch_positions_for_owner(&rpc, owner)
+        .await
+        .map_err(|e| anyhow!("fetch_positions_for_owner failed: {}", e))?;
+
+    Ok(positions)
+}
+
+
+pub async fn close_all_positions() -> Result<()> {
+    // 1) Получаем все позиции
+    let positions = list_positions_for_owner()
+        .await
+        .with_context(|| "Failed to fetch positions for owner")?;
+    let total = positions.len();
+    log::debug!("Found {} positions for owner", total);
+
+    if total == 0 {
+        log::debug!("У вас нет открытых позиций.");
+        return Ok(());
+    }
+
+    // 2) Итерируем по каждой позиции
+    for (idx, p) in positions.into_iter().enumerate() {
+        let slot = idx + 1;
+        match p {
+            PositionOrBundle::Position(hp) => {
+                // Собираем детали
+                let account   = hp.address;
+                let whirlpool = hp.data.whirlpool;
+                let mint      = hp.data.position_mint;
+                let liquidity = hp.data.liquidity;
+                let lo        = hp.data.tick_lower_index;
+                let hi        = hp.data.tick_upper_index;
+                let fee_a     = hp.data.fee_owed_a;
+                let fee_b     = hp.data.fee_owed_b;
+
+                log::debug!(
+                    "Closing {}/{}:\n\
+                     → account:   {}\n\
+                     → pool:      {}\n\
+                     → mint:      {}\n\
+                     → liquidity: {}\n\
+                     → ticks:     [{} .. {}]\n\
+                     → fees owed: A={}  B={}",
+                    slot, total, account, whirlpool, mint, liquidity, lo, hi, fee_a, fee_b
+                );
+
+                // 3) Попытка закрыть позицию
+                if let Err(err) = close_whirlpool_position(mint).await {
+                    log::error!(
+                        "❌ Error closing position {}/{} (mint={}): {:?}",
+                        slot, total, mint, err
+                    );
+                    // возвращаем ошибку с контекстом
+                    return Err(anyhow!("Failed at position {}/{} mint={}", slot, total, mint))
+                        .with_context(|| format!("Underlying error: {:?}", err));
+                }
+
+                log::debug!("✅ Successfully closed position {}/{}", slot, total);
+                // 4) Пауза между транзакциями
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            PositionOrBundle::PositionBundle(pb) => {
+                log::warn!(
+                    "Skipping bundled position {}/{} — bundle account {} contains {} inner positions",
+                    slot, total,
+                    pb.address,
+                    pb.positions.len()
+                );
+            }
+        }
+    }
+
+    log::debug!("🎉 All positions processed successfully.");
+    Ok(())
 }

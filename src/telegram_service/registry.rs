@@ -7,11 +7,14 @@ use crate::params::POOL;
 use crate::wirlpool_services::{
     get_info::fetch_pool_position_info,
     wirlpool::{
-        open_whirlpool_position, open_with_funds_check,
+        open_with_funds_check,
         harvest_whirlpool_position, summarize_harvest_fees,
-        close_whirlpool_position,
+        close_whirlpool_position, close_all_positions, list_positions_for_owner
     },
 };
+use orca_whirlpools::PositionOrBundle;
+use tokio::time::sleep;
+use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -34,6 +37,72 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
             }
         });
     }
+
+    {
+        let tx = Arc::clone(&tx);
+        commander.add_command(&["close", "all"], move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                // Начинаем процесс
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "🔒 Начинаем закрывать все позиции...".into(),
+                ));
+
+                // 1) Закрываем все позиции
+                if let Err(err) = close_all_positions().await {
+                    let _ = tx.send(ServiceCommand::SendMessage(format!(
+                        "❌ Ошибка при закрытии позиций: {:?}",
+                        err
+                    )));
+                } else {
+                    let _ = tx.send(ServiceCommand::SendMessage(
+                        "✅ Запросы на закрытие отправлены, дожидаемся подтверждения...".into(),
+                    ));
+                }
+
+                // 2) Ждём чуть-чуть, чтобы сеть и RPC подтянулися
+                sleep(Duration::from_secs(2)).await;
+
+                // 3) Проверяем, что осталось
+                match list_positions_for_owner().await {
+                    Ok(positions) => {
+                        if positions.is_empty() {
+                            let _ = tx.send(ServiceCommand::SendMessage(
+                                "🎉 Все позиции успешно закрыты.".into(),
+                            ));
+                        } else {
+                            // Формируем список оставшихся
+                            let mut msg = String::from("⚠️ Остались не закрытые позиции:\n");
+                            for p in positions {
+                                match p {
+                                    PositionOrBundle::Position(hp) => {
+                                        msg.push_str(&format!(
+                                            "- mint: {}\n",
+                                            hp.data.position_mint
+                                        ));
+                                    }
+                                    PositionOrBundle::PositionBundle(pb) => {
+                                        msg.push_str(&format!(
+                                            "- bundle account: {}\n",
+                                            pb.address
+                                        ));
+                                    }
+                                }
+                            }
+                            let _ = tx.send(ServiceCommand::SendMessage(msg));
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(format!(
+                            "❌ Ошибка при проверке позиций: {:?}",
+                            err
+                        )));
+                    }
+                }
+            }
+        });
+    }
+
 
     // 1. bal all
     commander.add_command(&["bal", "all"], {
@@ -64,53 +133,9 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
         }
     });
 
-    // 2. open --pct --usize
-    commander.add_command(&["open"], {
-        let tx = Arc::clone(&tx);
-        move |params| {
-            let tx = Arc::clone(&tx);
-            async move {
-                // --pct (ширина в %)
-                let pct = params.get(0)
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.4);
-                // --usize (сумма в USDC)
-                let initial_amount_usdc = params.get(1)
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(100.0);
-                let pool = POOL.clone();
-                let info_res = fetch_pool_position_info(&pool, None).await;
-                if let Ok(info) = info_res {
-                    let cp = info.current_price;
-                    let lower = cp * (1.0 - pct / 100.0);
-                    let upper = cp * (1.0 + pct / 100.0);
-
-                    match open_whirlpool_position(lower, upper, initial_amount_usdc, pool.clone()).await {
-                        Ok(mint) => {
-                            let _ = tx.send(ServiceCommand::SendMessage(
-                                format!(
-                                    "✅ Открыта новая позиция c диапазоном ±{:.2}% на сумму {:.2} USDC\nNFT mint: {}",
-                                    pct, initial_amount_usdc, mint
-                                )
-                            ));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(ServiceCommand::SendMessage(
-                                format!("Ошибка открытия позиции: {}", e)
-                            ));
-                        }
-                    }
-                } else {
-                    let _ = tx.send(ServiceCommand::SendMessage(
-                        format!("Ошибка получения текущей цены: {:?}", info_res.err())
-                    ));
-                }
-            }
-        }
-    });
 
     // open fc --pct --usize
-    commander.add_command(&["open", "fc"], {
+    commander.add_command(&["open"], {
         let tx = Arc::clone(&tx);
         move |params| {
             let tx = Arc::clone(&tx);
@@ -133,7 +158,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                             let _ = tx.send(ServiceCommand::SendMessage(
                                 format!(
                                     "✅ Открыта новая позиция (with funds check) c диапазоном ±{:.2}% на сумму {:.2} USDC\nNFT mint: {}",
-                                    pct, initial_amount_usdc, mint
+                                    pct, initial_amount_usdc, mint.position_mint
                                 )
                             ));
                         }
@@ -232,7 +257,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
     });
 
     // 4. close all
-    commander.add_command(&["close", "all"], {
+    commander.add_command(&["close", "full"], {
         let tx = Arc::clone(&tx);
         move |_params| {
             let tx = Arc::clone(&tx);

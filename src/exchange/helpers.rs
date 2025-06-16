@@ -1,4 +1,3 @@
-// test.rs
 use chrono::Local;
 use reqwest::Client;
 use serde_json::Value;
@@ -42,35 +41,31 @@ pub async fn get_kline(
 
     let mut candles = Vec::with_capacity(raw.len());
     for item in raw {
-        if item.len() < 6 {
-            continue;
-        }
+        if item.len() < 6 { continue; }
         let ts = item[0].as_i64().unwrap_or(0);
         let parse_f64 = |v: &Value| {
             v.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
+             .and_then(|s| s.parse::<f64>().ok())
+             .unwrap_or(0.0)
         };
         let open   = parse_f64(&item[1]);
         let high   = parse_f64(&item[2]);
         let low    = parse_f64(&item[3]);
         let close  = parse_f64(&item[4]);
         let volume = parse_f64(&item[5]);
-
         candles.push(Candle { timestamp: ts, open, high, low, close, volume });
     }
-
     Ok(candles)
 }
 
-/// Пересобирает в более крупный таймфрейм (агрегация OHLC и суммирование объёма).
+/// Агрегирует массивы OHLCV в более крупный таймфрейм.
 /// `timeframe` — сколько входных баров в одном выходном (например, 12 × 5m = 1h).
-/// Если `ln == 0`, то длина = ceil(n / timeframe), чтобы последняя неполная группа тоже вошла.
+/// Если `ln == 0`, длина = ceil(n / timeframe) (неполные группы тоже включаем).
 pub fn convert_timeframe(
-    opens: &[f64],
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
+    opens:   &[f64],
+    highs:   &[f64],
+    lows:    &[f64],
+    closes:  &[f64],
     volumes: &[f64],
     timeframe: usize,
     ln: usize,
@@ -81,7 +76,6 @@ pub fn convert_timeframe(
     } else {
         ln
     };
-
     let mut new_o = vec![0.0; length];
     let mut new_h = vec![f64::MIN; length];
     let mut new_l = vec![f64::MAX; length];
@@ -91,13 +85,9 @@ pub fn convert_timeframe(
     for i in 0..length {
         let end = n.saturating_sub(i * timeframe);
         let start = end.saturating_sub(timeframe);
-        let slice_h = &highs[start..end];
-        let slice_l = &lows[start..end];
-        let slice_v = &volumes[start..end];
-        let max_h = slice_h.iter().cloned().fold(f64::MIN, f64::max);
-        let min_l = slice_l.iter().cloned().fold(f64::MAX, f64::min);
-        let sum_v = slice_v.iter().sum();
-
+        let max_h = highs[start..end].iter().cloned().fold(f64::MIN, f64::max);
+        let min_l = lows[start..end].iter().cloned().fold(f64::MAX, f64::min);
+        let sum_v = volumes[start..end].iter().sum();
         let dst = length - 1 - i;
         new_o[dst] = opens[start];
         new_h[dst] = max_h;
@@ -105,66 +95,53 @@ pub fn convert_timeframe(
         new_c[dst] = closes[end - 1];
         new_v[dst] = sum_v;
     }
-
     (new_o, new_h, new_l, new_c, new_v)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1) Скачиваем 400 пяти-минутных баров
-    let candles = match get_kline("SOLUSDT", 400, 5).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "Error [{}]: не удалось получить свечи: {:?}",
-                Local::now(),
-                e
-            );
-            return Ok(());
-        }
-    };
-    println!("Получили {} 5m свечей", candles.len());
-
-    // 2) Подготовим массивы OHLCV
-    let opens:   Vec<f64> = candles.iter().map(|c| c.open).collect();
-    let highs:   Vec<f64> = candles.iter().map(|c| c.high).collect();
-    let lows:    Vec<f64> = candles.iter().map(|c| c.low).collect();
-    let closes:  Vec<f64> = candles.iter().map(|c| c.close).collect();
-    let volumes: Vec<f64> = candles.iter().map(|c| c.volume).collect();
-
-    // 3) Переконвертируем в 1-часовые (12×5m)
-    let (o1h, h1h, l1h, c1h, v1h) = convert_timeframe(
-        &opens, &highs, &lows, &closes, &volumes, 
-        12, 0
-    );
-    println!("Собрали {} часовых свечей (последняя неполная тоже):", o1h.len());
-    for i in 0..o1h.len().min(5) {
-        println!(
-            "  {}: O={:.6} H={:.6} L={:.6} C={:.6} V={:.6}",
-            i, o1h[i], h1h[i], l1h[i], c1h[i], v1h[i]
-        );
+/// Основная функция: возвращает вектор ATR по часовому таймфрейму.
+/// - `symbol` — торговая пара (e.g. "SOLUSDT")  
+/// - `five_min_limit` — сколько 5-минутных баров скачать (мы возьмём 400 по умолчанию)  
+/// - `timeframe` — сколько 5-минуток в одном баре (12 = 1h)  
+/// - `atr_period` — период ATR (14 по умолчанию)
+pub async fn get_atr_1h(
+    symbol: &str,
+    five_min_limit: usize,
+    timeframe: usize,
+    atr_period: usize,
+) -> Result<Vec<f64>> {
+    // 1) Скачиваем 5m-свечи
+    let candles_5m = get_kline(symbol, five_min_limit, 5).await?;
+    if candles_5m.is_empty() {
+        return Err(anyhow::anyhow!("Не удалось получить 5m свечи"));
     }
 
-    // 4) Теперь считаем ATR уже по этим 1h-данным
-    let mut atr = AverageTrueRange::new(14).expect("period > 0");
-    for (i, ((o, h), (l, c))) in o1h.iter()
-        .zip(h1h.iter())
-        .zip(l1h.iter().zip(c1h.iter()))
-        .enumerate()
-    {
+    // 2) Разделяем на отдельные векторы
+    let opens:   Vec<f64> = candles_5m.iter().map(|c| c.open).collect();
+    let highs:   Vec<f64> = candles_5m.iter().map(|c| c.high).collect();
+    let lows:    Vec<f64> = candles_5m.iter().map(|c| c.low).collect();
+    let closes:  Vec<f64> = candles_5m.iter().map(|c| c.close).collect();
+    let volumes: Vec<f64> = candles_5m.iter().map(|c| c.volume).collect();
+
+    // 3) Конвертируем в hourly
+    let (o1h, h1h, l1h, c1h, v1h) =
+        convert_timeframe(&opens, &highs, &lows, &closes, &volumes, timeframe, 0);
+
+    // 4) Считаем ATR по часовым барам
+    let mut atr = AverageTrueRange::new(atr_period)
+        .expect("period ATR must be > 0");
+    let mut result = Vec::with_capacity(o1h.len());
+    for i in 0..o1h.len() {
         let di = DataItem::builder()
-            .high(*h)
-            .low(*l)
-            .close(*c)
-            .open(*o)
+            .high(h1h[i])
+            .low(l1h[i])
+            .close(c1h[i])
+            .open(o1h[i])
             .volume(v1h[i])
             .build()
             .unwrap();
-        let value = atr.next(&di);
-        if i + 1 >= 14 {
-            println!("ATR[{}] = {:.6}", i, value);
-        }
+        let v = atr.next(&di);
+        result.push(v);
     }
 
-    Ok(())
+    Ok(result)
 }

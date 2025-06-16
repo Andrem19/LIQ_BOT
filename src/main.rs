@@ -39,14 +39,13 @@
 // }
 // src/main.rs
 
-// pub mod telegram;
+
 // pub mod params;
-// pub mod get_info;
 // pub mod exchange;
 // pub mod types;
-// pub mod swap;
-// pub mod net;
-// pub mod open_position;
+// pub mod telegram_service;
+// pub mod wirlpool_services;
+
 
 // use anyhow::Result;
 // use std::time::Duration;
@@ -89,6 +88,10 @@
 //     hl.open_sl(symbol, "Sell", position.size, position.entry_px, 0.01)
 //         .await?;
 //     println!("Stop-loss set at 1%");
+//     sleep(Duration::from_secs(1)).await;
+//     hl.open_tp(symbol, "Sell", position.size, position.entry_px, 0.01)
+//     .await?;
+//     println!("Take-profit set at 1%");
 
 //     // 6. Ждём одну минуту
 //     sleep(Duration::from_secs(20)).await;
@@ -362,7 +365,7 @@
 // use orca_whirlpools_core::{U128, sqrt_price_to_price};
 
 // use crate::wirlpool_services::wirlpool::{open_with_funds_check, open_whirlpool_position, close_whirlpool_position, harvest_whirlpool_position, summarize_harvest_fees, HarvestSummary};
-// use crate::params::POOLS;
+// use crate::params::POOL;
 // use crate::types::PoolConfig;
 
 // /// Ширина диапазона ±1%
@@ -392,14 +395,15 @@
 //     let mint_b_acct = rpc.get_account(&whirl.token_mint_b).await?;
 //     let dec_b = Mint::unpack(&mint_b_acct.data)?.decimals;
 //     // вычисляем цену и диапазон
-//     let price_now = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+//     let mut price_now = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+//     // price_now = 143.00;
 //     Ok((price_now * (1.0 - PCT_RANGE), price_now * (1.0 + PCT_RANGE)))
 // }
 
 // /// Точка входа. Раскомментируйте нужный тест.
 // #[tokio::main]
 // async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//     let pool = POOLS[0].clone();
+//     let pool = POOL.clone();
 //     test_open().await?;
 //     // test_harvest(pool.clone(), "Cdafq3j7Bo2Zy3MGCqgRAAVHRtSramMfBbFPsvaEMdB5").await?;
 //     // test_close("GqoZ9UQ89S5auCgnovkgV5ywemyCVaJnHWEhnuPgqYco").await?;
@@ -409,13 +413,13 @@
 // /// Тест открытия позиции
 // async fn test_open() -> Result<(), Box<dyn std::error::Error>> {
 //     let rpc = init_rpc();
-//     let pool = POOLS[0].clone();
+//     let pool = POOL.clone();
 //     println!("=== Testing OPEN on pool {} ({}) ===", pool.name, pool.pool_address);
 
 //     let (price_low, price_high) = get_price_bounds(&rpc, &pool).await?;
 //     println!("Price bounds: [{:.6}, {:.6}]", price_low, price_high);
 
-//     let position_mint = open_with_funds_check(price_low, price_high, 20.0, pool)
+//     let position_mint = open_with_funds_check(price_low, price_high, 30.0, pool)
 //         .await
 //         .map_err(|e| format!("open_whirlpool_position failed: {}", e))?;
 //     println!("✅ Opened position, NFT mint = {}", position_mint);
@@ -477,85 +481,223 @@
 // src/main.rs (или отдельный файл launcher.rs)
 
 
-mod types;
-pub mod exchange;
-mod params;
-mod wirlpool_services;
-mod telegram_service;
-mod orca_logic;
+// mod types;
+// pub mod exchange;
+// mod params;
+// mod wirlpool_services;
+// mod telegram_service;
+// mod orca_logic;
 
-use std::{thread, time::Duration};
-use chrono::Local;
-use telegram_service::tl_engine::{start, ServiceCommand};
-use dotenv::dotenv;
+// use std::{thread, time::Duration};
+// use chrono::Local;
+// use telegram_service::tl_engine::{start, ServiceCommand};
+// use dotenv::dotenv;
 
-#[tokio::main]
-async fn main() {
-    // 0. Опционально: подгружаем .env (TELEGRAM_API, CHAT_ID, HLSECRET_1, HL_TRADING_ADDRESS и т.д.)
-    dotenv().ok();
+// #[tokio::main]
+// async fn main() {
+//     // 0. Опционально: подгружаем .env (TELEGRAM_API, CHAT_ID, HLSECRET_1, HL_TRADING_ADDRESS и т.д.)
+//     dotenv().ok();
 
-    println!(
-        "[{}][INFO] Запуск LIQ_BOT: инициализация Telegram engine...",
-        Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
+//     println!(
+//         "[{}][INFO] Запуск LIQ_BOT: инициализация Telegram engine...",
+//         Local::now().format("%Y-%m-%d %H:%M:%S")
+//     );
 
-    // 1. Стартуем движок Telegram: он внутри сделает
-    //    - init Commander (Arc<Commander>)
-    //    - register_commands(...)
-    //    - spawn thread, который в цикле читает getUpdates и вызывает exec_command()
-    let (tx, _commander) = start();
+//     // 1. Стартуем движок Telegram: он внутри сделает
+//     //    - init Commander (Arc<Commander>)
+//     //    - register_commands(...)
+//     //    - spawn thread, который в цикле читает getUpdates и вызывает exec_command()
+//     let (tx, _commander) = start();
 
-    println!(
-        "[{}][INFO] Telegram engine успешно запущен. Команды зарегистрированы.",
-        Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
+//     println!(
+//         "[{}][INFO] Telegram engine успешно запущен. Команды зарегистрированы.",
+//         Local::now().format("%Y-%m-%d %H:%M:%S")
+//     );
 
-    // 2. Шлём стартовое уведомление в чат
-    let startup_msg = format!(
-        "✅ LIQ_BOT успешно запущен в {}",
-        Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-    if tx.send(ServiceCommand::SendMessage(startup_msg)).is_ok() {
-        println!(
-            "[{}][DEBUG] Стартовое сообщение отправлено в Telegram.",
-            Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-    } else {
-        eprintln!(
-            "[{}][ERROR] Не удалось отправить стартовое сообщение в Telegram.",
-            Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-    }
+//     // 2. Шлём стартовое уведомление в чат
+//     let startup_msg = format!(
+//         "✅ LIQ_BOT успешно запущен в {}",
+//         Local::now().format("%Y-%m-%d %H:%M:%S")
+//     );
+//     if tx.send(ServiceCommand::SendMessage(startup_msg)).is_ok() {
+//         println!(
+//             "[{}][DEBUG] Стартовое сообщение отправлено в Telegram.",
+//             Local::now().format("%Y-%m-%d %H:%M:%S")
+//         );
+//     } else {
+//         eprintln!(
+//             "[{}][ERROR] Не удалось отправить стартовое сообщение в Telegram.",
+//             Local::now().format("%Y-%m-%d %H:%M:%S")
+//         );
+//     }
 
-    // 3. Основной «таймерный» цикл приложения
-    //    Если вам не нужна дополнительная логика, можно просто спать.
-    println!(
-        "[{}][INFO] LIQ_BOT полностью запущен. Ожидание команд в Telegram…",
-        Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-    loop {
-        thread::sleep(Duration::from_secs(60));
-        println!(
-            "[{}][DEBUG] LIQ_BOT alive…",
-            Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-    }
-}
+//     // 3. Основной «таймерный» цикл приложения
+//     //    Если вам не нужна дополнительная логика, можно просто спать.
+//     println!(
+//         "[{}][INFO] LIQ_BOT полностью запущен. Ожидание команд в Telegram…",
+//         Local::now().format("%Y-%m-%d %H:%M:%S")
+//     );
+//     loop {
+//         thread::sleep(Duration::from_secs(60));
+//         println!(
+//             "[{}][DEBUG] LIQ_BOT alive…",
+//             Local::now().format("%Y-%m-%d %H:%M:%S")
+//         );
+//     }
+// }
 
 // pub mod params;
 // pub mod exchange;
 // pub mod types;
 // pub mod orca_logic;
+// pub mod telegram_service;
+// pub mod wirlpool_services;
+// use tokio::time::sleep;
+// use std::{str::FromStr, time::Duration};
+// use types::OpenPositionResult;
+// use orca_whirlpools_client::DecodedAccount;
+// use orca_whirlpools::PositionOrBundle;
 
-// use params::{PCT_LIST, WEIGHTS, TOTAL_USDC};
+// use anyhow::anyhow;
+// use solana_client::nonblocking::rpc_client::RpcClient;
+// use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
+// use spl_token::state::Mint;
+// use spl_token::solana_program::program_pack::Pack;
+// use orca_whirlpools_core::{U128, sqrt_price_to_price};
+// use orca_whirlpools_client::Whirlpool;
+// use dotenv::dotenv;
+// use env_logger::Env;
+// use log::LevelFilter;
 
-// fn main() {
-//     let price = 160.0;
+// use params::{PCT_LIST, WEIGHTS, TOTAL_USDC, POOL};
+// use orca_logic::helpers::{calc_bound_prices_struct, calc_range_allocation_struct};
+// use crate::wirlpool_services::wirlpool::open_with_funds_check;
 
-//     let bounds = orca_logic::helpers::calc_bound_prices_struct(price, &PCT_LIST);
-//     let allocs = orca_logic::helpers::calc_range_allocation_struct(price, &bounds, &WEIGHTS, TOTAL_USDC);
+// #[tokio::main]
+// async fn main() -> anyhow::Result<()> {
+//     dotenv().ok();
 
-//     for a in allocs {
-//         println!("{:?}", a);
+//     env_logger::Builder::from_env(Env::default().default_filter_or("debug"))
+//     .init();
+//     // 1) Создаём асинхронный RPC‐клиент к Mainnet
+//     let rpc = RpcClient::new_with_commitment(
+//         "https://api.mainnet-beta.solana.com".to_string(),
+//         CommitmentConfig::confirmed(),
+//     );
+
+//     // 2) Парсим Pubkey пула и читаем его on‐chain аккаунт
+//     let whirl_pk = Pubkey::from_str(&POOL.pool_address)?;
+//     let acct    = rpc.get_account(&whirl_pk).await?;
+//     let whirl   = Whirlpool::from_bytes(&acct.data)?;
+
+//     // 3) Получаем decimals для токенов A и B
+//     let mint_a_acct = rpc.get_account(&whirl.token_mint_a).await?;
+//     let da = Mint::unpack(&mint_a_acct.data)?.decimals as i32;
+//     let mint_b_acct = rpc.get_account(&whirl.token_mint_b).await?;
+//     let db = Mint::unpack(&mint_b_acct.data)?.decimals as i32;
+
+//     // 4) Вычисляем текущую цену SOL→USDC из sqrt_price
+//     let price = sqrt_price_to_price(U128::from(whirl.sqrt_price), da as u8, db as u8);
+//     println!("Current pool price: {:.6}", price);
+
+//     // 5) Строим границы и вычисляем аллокацию
+//     let bounds = calc_bound_prices_struct(price, &PCT_LIST);
+//     let allocs = calc_range_allocation_struct(price, &bounds, &WEIGHTS, TOTAL_USDC);
+
+//     println!("{:?}", allocs);
+
+//     // 6) Печатаем результат
+//     // let upper = allocs[0].clone();
+//     // let position_upper: OpenPositionResult = open_with_funds_check(upper.lower_price, upper.upper_price, upper.usdc_equivalent, POOL).await
+//     // .map_err(op("open_with_funds_check 1"))?;
+
+//     // sleep(Duration::from_millis(1500)).await;
+
+//     // let middle = allocs[1].clone();
+//     // let position_middle: OpenPositionResult = open_with_funds_check(middle.lower_price, middle.upper_price, middle.usdc_amount, POOL).await
+//     // .map_err(op("open_with_funds_check 2"))?;
+
+//     // sleep(Duration::from_millis(1500)).await;
+
+//     // let lower = allocs[2].clone();
+//     // let position_lower: OpenPositionResult = open_with_funds_check(lower.lower_price, lower.upper_price, lower.usdc_equivalent, POOL).await
+//     // .map_err(op("open_with_funds_check 2"))?;
+
+
+//     // 2) Все позиции в конкретном пуле POOL
+//     let my_positions = wirlpool_services::wirlpool::list_positions_for_owner().await?;
+//     for p in &my_positions {
+//         match p {
+//             PositionOrBundle::Position(hp) => {
+//                 println!("Single position:");
+//                 println!("  address: {}", hp.address);
+//                 println!("  pool:    {}", hp.data.whirlpool);
+//                 println!("  mint:    {}", hp.data.position_mint);
+//                 println!("  liquidity: {}", hp.data.liquidity);
+//                 println!("  ticks: [{} .. {}]",
+//                     hp.data.tick_lower_index, hp.data.tick_upper_index);
+//                 println!("  fees A/B owed: {}/{}",
+//                     hp.data.fee_owed_a, hp.data.fee_owed_b);
+//             }
+//             PositionOrBundle::PositionBundle(hb) => {
+//                 println!("Bundled position:");
+//                 println!("  bundle account: {}", hb.address);
+//                 println!("  inner positions:");
+//                 for inner in &hb.positions {
+//                     println!("    - {}", inner.address);
+//                 }
+//             }
+//         }
 //     }
+//     // wirlpool_services::wirlpool::close_all_positions().await?;
+
+//     Ok(())
 // }
+
+// fn op<E: std::fmt::Display>(ctx: &'static str) -> impl FnOnce(E) -> anyhow::Error {
+//     move |e| anyhow!("{} failed: {}", ctx, e)
+// }
+
+
+mod params;
+mod types;
+mod orca_logic;
+mod telegram_service;
+mod wirlpool_services;
+mod exchange;
+mod orchestrator;
+
+use anyhow::Result;
+use dotenv::dotenv;
+
+use std::time::Duration;
+use tokio::time::sleep;
+use env_logger::Env;
+
+use crate::telegram_service::tl_engine::ServiceCommand;
+
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+    // env_logger::Builder::from_env(Env::default().default_filter_or("debug"))
+    // .init();
+
+    // 1. start Telegram service
+    let (tx_telegram, _commander) = telegram_service::tl_engine::start();
+
+    // 2. start Hyperliquid hedge worker
+    let tx_hl = exchange::hl_engine::start()?;
+
+    // 3. orchestrator: infinite cycle
+    loop {
+        if let Err(e) = orchestrator::orchestrator_cycle(&tx_telegram, &tx_hl).await {
+            eprintln!("[ERROR] orchestrator cycle failed: {:?}", e);
+            let _ = tx_telegram.send(ServiceCommand::SendMessage(
+                format!("❌ Bot error: {:?}", e)
+            ));
+        }
+        // small pause before restarting cycle
+        sleep(Duration::from_secs(10)).await;
+    }
+}

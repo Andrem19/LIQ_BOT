@@ -89,15 +89,21 @@ pub async fn execute_swap(
     let amount_in_atoms = if sell_mint == "So11111111111111111111111111111111111111112" {
         // Цена SOL
         let resp = http
-            .get("https://price.jup.ag/v6/price?ids=SOL")
+            .get("https://lite-api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112")
             .send().await?;
         let status = resp.status();
         let body   = resp.text().await?;
+        println!("{:?}", body);
         println!("DEBUG price status={} body={}", status, body);
         let price_json: Value = serde_json::from_str(&body)
             .map_err(|e| anyhow!("Price JSON parse error: {} (body={})", e, body))?;
-        let sol_price = price_json["data"]["SOL"]["price"]
-            .as_f64().ok_or_else(|| anyhow!("no SOL price in response"))?;
+        let price_str = price_json["data"]["So11111111111111111111111111111111111111112"]["price"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no SOL price string in response"))?;
+        let sol_price: f64 = price_str.parse()
+            .map_err(|e| anyhow!("parse SOL price error: {}", e))?;
+
+        // 4) считаем, сколько атомов WSOL нужно под amount_usd
         let sol_qty = amount_usd / sol_price;
         (sol_qty * 10f64.powi(in_dec as i32)) as u64
     } else {

@@ -1,4 +1,4 @@
-
+use solana_sdk::pubkey::Pubkey;
 #[derive(Debug)]
 pub struct PoolPositionInfo {
     pub pending_a: f64,
@@ -37,16 +37,17 @@ pub struct LiqPosition {
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     pub amount: f64,
-    pub program:               &'static str, // всегда whirLbM…  на mainnet, но оставляем для devnet
+    pub program:               &'static str,
     pub name:                  &'static str,
     pub pool_address:          &'static str,
-    pub position_1:      Option<LiqPosition>, // None  → позиции ещё нет
-    pub position_2:      Option<LiqPosition>, // None  → позиции ещё нет
-    pub position_3:      Option<LiqPosition>, // None  → позиции ещё нет
+    pub position_1:      Option<LiqPosition>,
+    pub position_2:      Option<LiqPosition>,
+    pub position_3:      Option<LiqPosition>,
     pub mint_a:                &'static str,
     pub mint_b:                &'static str,
     pub decimal_a:             u16,
     pub decimal_b:             u16,
+    pub sol_init: f64
 }
 
 
@@ -81,4 +82,13 @@ pub enum WorkerCommand {
     On(PoolConfig),
     /// Immediately force-close any open position and go idle.
     Off,
+}
+
+#[derive(Debug)]
+pub struct OpenPositionResult {
+    pub position_mint: Pubkey,
+    /// Объём WSOL (в единицах токена, не в атомах)
+    pub amount_wsol: f64,
+    /// Объём USDC (в единицах токена, не в атомах)
+    pub amount_usdc: f64,
 }
