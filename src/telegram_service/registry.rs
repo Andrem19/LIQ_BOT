@@ -49,7 +49,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                 ));
 
                 // 1) Закрываем все позиции
-                if let Err(err) = close_all_positions().await {
+                if let Err(err) = close_all_positions(300).await {
                     let _ = tx.send(ServiceCommand::SendMessage(format!(
                         "❌ Ошибка при закрытии позиций: {:?}",
                         err
@@ -153,7 +153,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                     let lower = cp * (1.0 - pct / 100.0);
                     let upper = cp * (1.0 + pct / 100.0);
 
-                    match open_with_funds_check(lower, upper, initial_amount_usdc, pool.clone()).await {
+                    match open_with_funds_check(lower, upper, initial_amount_usdc, pool.clone(), 200).await {
                         Ok(mint) => {
                             let _ = tx.send(ServiceCommand::SendMessage(
                                 format!(
@@ -269,7 +269,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                         Some(nft_addr) => {
                             let mint_res = Pubkey::from_str(nft_addr);
                             if let Ok(mint) = mint_res {
-                                match close_whirlpool_position(mint).await {
+                                match close_whirlpool_position(mint, 150).await {
                                     Ok(_) => format!("✅ Closed position {}", idx + 1),
                                     Err(e) => format!("Ошибка закрытия позиции {}: {}", idx + 1, e),
                                 }
@@ -304,7 +304,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                 let msg = match pos.and_then(|p| p.position_nft) {
                     Some(nft_addr) => {
                         if let Ok(mint) = Pubkey::from_str(nft_addr) {
-                            match close_whirlpool_position(mint).await {
+                            match close_whirlpool_position(mint, 150).await {
                                 Ok(_) => format!("✅ Closed position {}", pos_num),
                                 Err(e) => format!("Ошибка закрытия позиции {}: {}", pos_num, e),
                             }

@@ -26,8 +26,7 @@ use crate::exchange::helpers::get_atr_1h;
 
 
 pub async fn orchestrator_cycle(
-    tx_telegram: &UnboundedSender<ServiceCommand>,
-    tx_hl: &UnboundedSender<WorkerCommand>,
+    tx_telegram: &UnboundedSender<ServiceCommand>
 ) -> Result<()> {
     let pool_address = env::var("POOL_ADDRESS")
         .map_err(|e| anyhow!("Не удалось прочитать POOL_ADDRESS из .env: {}", e))?;
@@ -52,6 +51,8 @@ pub async fn orchestrator_cycle(
         let _ = tx_telegram.send(ServiceCommand::SendMessage(
             "⚠️ Перед открытием новых позиций нужно закрыть старые!".into()
         ));
+        // tx_hl.send(WorkerCommand::Off)?;
+        close_all_positions(300).await?;
         return Err(anyhow!("Есть непустые позиции, прерываю цикл"));
     }
 
@@ -76,6 +77,8 @@ pub async fn orchestrator_cycle(
     // будем хранить только (index, position_mint)
     let mut minted: Vec<(usize, Pubkey)> = Vec::with_capacity(3);
 
+    let mut slippage: u16 = 100;
+
     for attempt in 1..=2 {
         for (idx, alloc) in allocs.iter().enumerate() {
             // если эта позиция ещё не открыта — пробуем
@@ -85,12 +88,13 @@ pub async fn orchestrator_cycle(
                 } else {
                     alloc.usdc_equivalent
                 };
-
+                
                 match open_with_funds_check(
                     alloc.lower_price,
                     alloc.upper_price,
                     deposit,
                     pool_cfg.clone(),
+                    slippage
                 ).await {
                     Ok(res) => {
                         sol_total += res.amount_wsol;
@@ -134,8 +138,10 @@ pub async fn orchestrator_cycle(
             let _ = tx_telegram.send(ServiceCommand::SendMessage(
                 format!("⚠️ После первой попытки открыто {}/3, пробуем недостающие…", got.len())
             ));
+            slippage = 250;
+            sleep(Duration::from_secs(1)).await;
         } else {
-            close_all_positions().await?;
+            close_all_positions(150).await?;
             let _ = tx_telegram.send(ServiceCommand::SendMessage(
                 format!("❌ Не удалось открыть все 3 позиции (открыто {}). Была попытка их закрыть. Перерыв.", got.len())
             ));
@@ -178,7 +184,7 @@ pub async fn orchestrator_cycle(
         }
     }
 
-    tx_hl.send(WorkerCommand::On(cfg.clone()))?;
+    // tx_hl.send(WorkerCommand::On(cfg.clone()))?;
 
     // --- 5. Мониторинг: отчёт каждые 5 мин, проверка цены каждые 30 сек ---
     let upper_exit = cfg.position_1.as_ref().unwrap().upper_price;
@@ -246,8 +252,8 @@ pub async fn orchestrator_cycle(
                         )
                     ));
             
-                    close_all_positions().await?;
-                    tx_hl.send(WorkerCommand::Off)?;
+                    close_all_positions(150).await?;
+                    // tx_hl.send(WorkerCommand::Off)?;
             
                     // балансы после
                     let keypair = read_keypair_file(KEYPAIR_FILENAME)

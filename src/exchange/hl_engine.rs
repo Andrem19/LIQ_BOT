@@ -69,21 +69,10 @@ pub fn start() -> Result<UnboundedSender<WorkerCommand>> {
                                     // Узнаём реальный размер
                                     if let Ok(Some(pos)) = hl.get_position("SOLUSDT").await {
                                         pos_size = pos.size;
-                                        // Берём TP из position_1.upper, SL из position_3.lower
-                                        if let Some(p1) = cfg.position_1.clone() {
-                                            tp_price = p1.upper_price;
-                                        }
-                                        if let Some(p3) = cfg.position_3.clone() {
-                                            sl_price = p3.lower_price;
-                                        }
-                                        sleep(Duration::from_millis(2000)).await;
-                                        // Переводим в относительные проценты
-                                        let tp_perc = if entry_px>0.0 { (tp_price/entry_px)-1.0 } else { 0.0 };
-                                        let sl_perc = if entry_px>0.0 { 1.0-(sl_price/entry_px) } else { 0.0 };
                                         // Ставим TP и SL
-                                        let _ = hl.open_tp("SOLUSDT", "Sell", pos_size, entry_px, tp_perc+0.004).await;
+                                        let _ = hl.open_tp("SOLUSDT", "Sell", pos_size, entry_px, 0.016).await;
                                         sleep(Duration::from_millis(500)).await;
-                                        let _ = hl.open_sl("SOLUSDT", "Sell", pos_size, entry_px, sl_perc+0.004).await;
+                                        let _ = hl.open_sl("SOLUSDT", "Sell", pos_size, entry_px, 0.016).await;
                                         running = true;
                                     }
                                 }
@@ -119,21 +108,21 @@ pub fn start() -> Result<UnboundedSender<WorkerCommand>> {
                 },
 
                 // Каждые 5 с, если в режиме `On`, проверяем цену
-                _ = sleep(Duration::from_secs(5)), if running => {
-                    if let Ok(price) = hl.get_last_price("SOLUSDT").await {
-                        if price >= tp_price || price <= sl_price {
-                            // Закрываем по тейку или стопу
-                            if let Ok(Some(pos)) = hl.get_position("SOLUSDT").await {
-                                let _ = hl.open_market_order("SOLUSDT", "Sell", 0.0, true, pos.size).await;
-                                if let Ok(bal) = hl.get_balance().await {
-                                    let msg = format!("🔔 Auto-closed at {:.2}. Balance: ${:.2}", price, bal);
-                                    let _ = tele.send(&msg).await;
-                                }
-                            }
-                            running = false;
-                        }
-                    }
-                }
+                // _ = sleep(Duration::from_secs(5)), if running => {
+                //     if let Ok(price) = hl.get_last_price("SOLUSDT").await {
+                //         if price >= tp_price || price <= sl_price {
+                //             // Закрываем по тейку или стопу
+                //             if let Ok(Some(pos)) = hl.get_position("SOLUSDT").await {
+                //                 let _ = hl.open_market_order("SOLUSDT", "Sell", 0.0, true, pos.size).await;
+                //                 if let Ok(bal) = hl.get_balance().await {
+                //                     let msg = format!("🔔 Auto-closed at {:.2}. Balance: ${:.2}", price, bal);
+                //                     let _ = tele.send(&msg).await;
+                //                 }
+                //             }
+                //             running = false;
+                //         }
+                //     }
+                // }
             }
         }
     });

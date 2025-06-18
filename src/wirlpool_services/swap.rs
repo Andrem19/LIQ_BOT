@@ -60,20 +60,138 @@ fn send_signed_tx(
 }
 
 /// Основной API свопа через Jupiter.
+// pub async fn execute_swap(
+//     _pool_cfg: &PoolConfig,  // для совместимости
+//     sell_mint: &str,         // что продаём
+//     buy_mint:  &str,         // что покупаем
+//     amount_usd: f64,         // если WSOL — сумма в USD, иначе — кол-во USDC
+// ) -> Result<SwapResult> {
+//     // 0) Кошелёк и клиенты
+//     let payer: Keypair = read_keypair_file(KEYPAIR_FILENAME)
+//         .map_err(|e| anyhow!("keypair: {e}"))?;
+//     let wallet = payer.pubkey();
+//     let rpc    = RpcClient::new(RPC_URL.to_string());
+//     let http   = http_client();
+
+//     // 1) Поддерживаем только WSOL и USDC
+//     let (in_mint, in_dec) = match sell_mint {
+//         "So11111111111111111111111111111111111111112" => (Pubkey::from_str(sell_mint)?, 9),
+//         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => (Pubkey::from_str(sell_mint)?, 6),
+//         _ => bail!("sell_mint не поддерживается"),
+//     };
+//     let (out_mint, out_dec) = match buy_mint {
+//         "So11111111111111111111111111111111111111112" => (Pubkey::from_str(buy_mint)?, 9),
+//         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => (Pubkey::from_str(buy_mint)?, 6),
+//         _ => bail!("buy_mint не поддерживается"),
+//     };
+
+//     // 2) Считаем amount_in в атомах
+//     let amount_in_atoms = if sell_mint == "So11111111111111111111111111111111111111112" {
+//         // Цена SOL
+//         let resp = http
+//             .get("https://lite-api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112")
+//             .send().await?;
+//         let status = resp.status();
+//         let body   = resp.text().await?;
+//         println!("{:?}", body);
+//         println!("DEBUG price status={} body={}", status, body);
+//         let price_json: Value = serde_json::from_str(&body)
+//             .map_err(|e| anyhow!("Price JSON parse error: {} (body={})", e, body))?;
+//         let price_str = price_json["data"]["So11111111111111111111111111111111111111112"]["price"]
+//         .as_str()
+//         .ok_or_else(|| anyhow!("no SOL price string in response"))?;
+//         let sol_price: f64 = price_str.parse()
+//             .map_err(|e| anyhow!("parse SOL price error: {}", e))?;
+
+//         // 4) считаем, сколько атомов WSOL нужно под amount_usd
+//         let sol_qty = amount_usd / sol_price;
+//         (sol_qty * 10f64.powi(in_dec as i32)) as u64
+//     } else {
+//         // Для USDC: amount_usd = кол-во токена
+//         (amount_usd * 10f64.powi(in_dec as i32)) as u64
+//     };
+
+//     // 3) Quote
+//     let quote_url = format!(
+//         "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50&onlyDirectRoutes=true",
+//         in_mint, out_mint, amount_in_atoms
+//     );
+//     let resp = http.get(&quote_url).send().await?;
+//     let status = resp.status();
+//     let body   = resp.text().await?;
+//     println!("DEBUG quote status={} body={}", status, body);
+//     let quote_json: Value = serde_json::from_str(&body)
+//         .map_err(|e| anyhow!("Quote JSON parse error: {} (body={})", e, body))?;
+//     // будем передавать весь ответ в поле quoteResponse
+//     let quote_response = quote_json.clone();
+
+//     // 4) Build swap (legacy tx) с правильным полем quoteResponse
+//     let swap_body = serde_json::json!({
+//         "quoteResponse": quote_response,
+//         "userPublicKey": wallet.to_string(),
+//         "wrapAndUnwrapSol": true,
+//         "asLegacyTransaction": true
+//     });
+
+//     let resp = http
+//         .post("https://quote-api.jup.ag/v6/swap")
+//         .json(&swap_body)
+//         .send()
+//         .await?;
+//     let status = resp.status();
+//     let body   = resp.text().await?;
+//     println!("DEBUG swap status={} body={}", status, body);
+
+//     // Теперь разбор
+//     let swap_json: Value = serde_json::from_str(&body)
+//         .map_err(|e| anyhow!("Swap JSON parse error: {} (body={})", e, body))?;
+//     let swap_tx_b64 = swap_json["swapTransaction"]
+//         .as_str()
+//         .ok_or_else(|| anyhow!("Jupiter: нет swapTransaction in response"))?;
+
+//     // 5) Декодим, подписываем и отправляем
+//     let tx_bytes = b64.decode(swap_tx_b64)?;
+//     let tx: Transaction = deserialize(&tx_bytes)
+//         .map_err(|e| anyhow!("bincode deserialize error: {}", e))?;
+//     let send_res = send_signed_tx(&rpc, tx, &payer);
+//     if let Err(err) = send_res {
+//         let msg = err.to_string();
+//         // если это именно наша «виртуальная» ошибка от Jupiter wrap/close
+//         if msg.contains("could not find account") {
+//             // просто логируем и продолжаем дальше — SOL у нас уже на балансе
+//             eprintln!("⚠️  warning: Jupiter wrapper error ignored: {}", msg);
+//         } else {
+//             // а остальные — прокидываем дальше
+//             return Err(err);
+//         }
+//     }
+
+//     // 6) Финальные балансы
+//     let ata_in  = get_associated_token_address(&wallet, &in_mint);
+//     let ata_out = get_associated_token_address(&wallet, &out_mint);
+//     let bal_in  = get_token_balance_u64(&rpc, &ata_in)?  as f64 / 10f64.powi(in_dec as i32);
+//     let bal_out = get_token_balance_u64(&rpc, &ata_out)? as f64 / 10f64.powi(out_dec as i32);
+
+//     Ok(SwapResult {
+//         balance_sell: bal_in,
+//         balance_buy:  bal_out,
+//     })
+// }
+
 pub async fn execute_swap(
-    _pool_cfg: &PoolConfig,  // для совместимости
-    sell_mint: &str,         // что продаём
-    buy_mint:  &str,         // что покупаем
-    amount_usd: f64,         // если WSOL — сумма в USD, иначе — кол-во USDC
+    _pool_cfg: &PoolConfig,   // для совместимости
+    sell_mint: &str,          // что продаём
+    buy_mint:  &str,          // что покупаем
+    amount_usd: f64,          // если WSOL — сумма в USD, иначе — кол-во USDC
 ) -> Result<SwapResult> {
-    // 0) Кошелёк и клиенты
+    // 0) Кошелёк и клиенты ----------------------------------------------------
     let payer: Keypair = read_keypair_file(KEYPAIR_FILENAME)
         .map_err(|e| anyhow!("keypair: {e}"))?;
     let wallet = payer.pubkey();
     let rpc    = RpcClient::new(RPC_URL.to_string());
     let http   = http_client();
 
-    // 1) Поддерживаем только WSOL и USDC
+    // 1) Поддерживаем только WSOL и USDC --------------------------------------
     let (in_mint, in_dec) = match sell_mint {
         "So11111111111111111111111111111111111111112" => (Pubkey::from_str(sell_mint)?, 9),
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => (Pubkey::from_str(sell_mint)?, 6),
@@ -85,95 +203,96 @@ pub async fn execute_swap(
         _ => bail!("buy_mint не поддерживается"),
     };
 
-    // 2) Считаем amount_in в атомах
+    // 2) amount_in в атомах ----------------------------------------------------
     let amount_in_atoms = if sell_mint == "So11111111111111111111111111111111111111112" {
         // Цена SOL
         let resp = http
             .get("https://lite-api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112")
             .send().await?;
-        let status = resp.status();
-        let body   = resp.text().await?;
-        println!("{:?}", body);
-        println!("DEBUG price status={} body={}", status, body);
-        let price_json: Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("Price JSON parse error: {} (body={})", e, body))?;
-        let price_str = price_json["data"]["So11111111111111111111111111111111111111112"]["price"]
-        .as_str()
-        .ok_or_else(|| anyhow!("no SOL price string in response"))?;
-        let sol_price: f64 = price_str.parse()
-            .map_err(|e| anyhow!("parse SOL price error: {}", e))?;
-
-        // 4) считаем, сколько атомов WSOL нужно под amount_usd
+        let price_json: Value = serde_json::from_str(&resp.text().await?)
+            .map_err(|e| anyhow!("Price JSON parse error: {e}"))?;
+        let sol_price: f64 = price_json["data"]["So11111111111111111111111111111111111111112"]["price"]
+            .as_str().ok_or_else(|| anyhow!("no SOL price string"))?
+            .parse().map_err(|e| anyhow!("parse SOL price error: {e}"))?;
         let sol_qty = amount_usd / sol_price;
         (sol_qty * 10f64.powi(in_dec as i32)) as u64
     } else {
-        // Для USDC: amount_usd = кол-во токена
         (amount_usd * 10f64.powi(in_dec as i32)) as u64
     };
 
-    // 3) Quote
-    let quote_url = format!(
-        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50&onlyDirectRoutes=true",
-        in_mint, out_mint, amount_in_atoms
-    );
-    let resp = http.get(&quote_url).send().await?;
-    let status = resp.status();
-    let body   = resp.text().await?;
-    println!("DEBUG quote status={} body={}", status, body);
-    let quote_json: Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("Quote JSON parse error: {} (body={})", e, body))?;
-    // будем передавать весь ответ в поле quoteResponse
-    let quote_response = quote_json.clone();
+    // 3) две попытки: 50 bps → 150 bps ----------------------------------------
+    for slippage_bps in [50_u16, 150_u16] {
+        // --- 3.1 Quote -------------------------------------------------------
+        let quote_url = format!(
+            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false",
+            in_mint, out_mint, amount_in_atoms, slippage_bps
+        );
+        let resp = http.get(&quote_url).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        
+        println!("DEBUG quote ({} bps) status={} body={}", slippage_bps, status, body);
+        let quote_json: Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("Quote JSON parse error: {e} (body={})", body))?;
+        let quote_response = quote_json.clone();
 
-    // 4) Build swap (legacy tx) с правильным полем quoteResponse
-    let swap_body = serde_json::json!({
-        "quoteResponse": quote_response,
-        "userPublicKey": wallet.to_string(),
-        "wrapAndUnwrapSol": true,
-        "asLegacyTransaction": true
-    });
+        // --- 3.2 Build swap --------------------------------------------------
+        let swap_body = serde_json::json!({
+            "quoteResponse": quote_response,
+            "userPublicKey": wallet.to_string(),
+            "wrapAndUnwrapSol": true,
+            "asLegacyTransaction": true
+        });
+        let resp = http
+            .post("https://quote-api.jup.ag/v6/swap")
+            .json(&swap_body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        println!("DEBUG swap ({} bps) status={} body={}", slippage_bps, status, body);
+        let swap_json: Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("Swap JSON parse error: {e} (body={})", body))?;
+        let Some(swap_tx_b64) = swap_json["swapTransaction"].as_str() else {
+            // если Jupiter не вернул транзу → пробуем ↑ slippage
+            if slippage_bps == 150 { bail!("Jupiter swapTransaction missing") } else { continue }
+        };
 
-    let resp = http
-        .post("https://quote-api.jup.ag/v6/swap")
-        .json(&swap_body)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body   = resp.text().await?;
-    println!("DEBUG swap status={} body={}", status, body);
+        // --- 3.3 Декодим, подписываем, отправляем ---------------------------
+        let tx_bytes = b64.decode(swap_tx_b64)?;
+        let tx: Transaction = deserialize(&tx_bytes)
+            .map_err(|e| anyhow!("bincode deserialize error: {e}"))?;
+        let send_res = send_signed_tx(&rpc, tx, &payer);
 
-    // Теперь разбор
-    let swap_json: Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("Swap JSON parse error: {} (body={})", e, body))?;
-    let swap_tx_b64 = swap_json["swapTransaction"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Jupiter: нет swapTransaction in response"))?;
-
-    // 5) Декодим, подписываем и отправляем
-    let tx_bytes = b64.decode(swap_tx_b64)?;
-    let tx: Transaction = deserialize(&tx_bytes)
-        .map_err(|e| anyhow!("bincode deserialize error: {}", e))?;
-    let send_res = send_signed_tx(&rpc, tx, &payer);
-    if let Err(err) = send_res {
-        let msg = err.to_string();
-        // если это именно наша «виртуальная» ошибка от Jupiter wrap/close
-        if msg.contains("could not find account") {
-            // просто логируем и продолжаем дальше — SOL у нас уже на балансе
-            eprintln!("⚠️  warning: Jupiter wrapper error ignored: {}", msg);
-        } else {
-            // а остальные — прокидываем дальше
-            return Err(err);
+        match send_res {
+            Ok(_) => {
+                // --- 3.4 Финальные балансы ----------------------------------
+                let ata_in  = get_associated_token_address(&wallet, &in_mint);
+                let ata_out = get_associated_token_address(&wallet, &out_mint);
+                let bal_in  = get_token_balance_u64(&rpc, &ata_in)?  as f64 / 10f64.powi(in_dec as i32);
+                let bal_out = get_token_balance_u64(&rpc, &ata_out)? as f64 / 10f64.powi(out_dec as i32);
+                return Ok(SwapResult { balance_sell: bal_in, balance_buy: bal_out });
+            },
+            Err(err) => {
+                let msg = err.to_string();
+                // «виртуальную» ошибку Ignorируем, как раньше
+                if msg.contains("could not find account") {
+                    eprintln!("⚠️  warning: Jupiter wrapper error ignored: {}", msg);
+                    let ata_in  = get_associated_token_address(&wallet, &in_mint);
+                    let ata_out = get_associated_token_address(&wallet, &out_mint);
+                    let bal_in  = get_token_balance_u64(&rpc, &ata_in)?  as f64 / 10f64.powi(in_dec as i32);
+                    let bal_out = get_token_balance_u64(&rpc, &ata_out)? as f64 / 10f64.powi(out_dec as i32);
+                    return Ok(SwapResult { balance_sell: bal_in, balance_buy: bal_out });
+                }
+                // если это была первая попытка (50 bps) — пробуем 150 bps
+                if slippage_bps == 50 {
+                    println!("Retrying with 150 bps because: {}", msg);
+                    continue;
+                } else {
+                    return Err(err.into());
+                }
+            }
         }
     }
-
-    // 6) Финальные балансы
-    let ata_in  = get_associated_token_address(&wallet, &in_mint);
-    let ata_out = get_associated_token_address(&wallet, &out_mint);
-    let bal_in  = get_token_balance_u64(&rpc, &ata_in)?  as f64 / 10f64.powi(in_dec as i32);
-    let bal_out = get_token_balance_u64(&rpc, &ata_out)? as f64 / 10f64.powi(out_dec as i32);
-
-    Ok(SwapResult {
-        balance_sell: bal_in,
-        balance_buy:  bal_out,
-    })
+    unreachable!("loop must return or error earlier");
 }

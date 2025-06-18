@@ -23,6 +23,12 @@ use orca_whirlpools::{
     fetch_positions_in_whirlpool,
     PositionOrBundle,
 };
+use orca_whirlpools_client::CollectFeesV2InstructionArgs;
+use orca_whirlpools::DecreaseLiquidityParam;
+use orca_whirlpools_client::CollectFeesV2;
+use orca_whirlpools::decrease_liquidity_instructions;
+use orca_whirlpools::DecreaseLiquidityInstruction;
+use orca_whirlpools::ClosePositionInstruction;
 use solana_sdk::system_instruction;
 use spl_associated_token_account::instruction::create_associated_token_account;
 use spl_token::instruction::sync_native;
@@ -31,11 +37,13 @@ use orca_whirlpools_core::IncreaseLiquidityQuote;
 use crate::wirlpool_services::swap::SwapResult;
 use spl_token::state::Mint;
 use orca_whirlpools_client::{Whirlpool,Position, DecodedAccount};
+use orca_whirlpools_core::price_to_tick_index;
 use orca_whirlpools::{
     close_position_instructions, harvest_position_instructions, open_position_instructions,
     set_whirlpools_config_address, HarvestPositionInstruction, IncreaseLiquidityParam,
     WhirlpoolsConfigInput,
 };
+use orca_whirlpools_core::tick_index_to_price;
 use orca_whirlpools_core::{CollectFeesQuote, U128, sqrt_price_to_price};
 use crate::wirlpool_services::swap::execute_swap;
 use crate::params;
@@ -110,27 +118,138 @@ mod utils {
 }
 
 /// Закрывает позицию; возвращает `()` при успехе.
-pub async fn close_whirlpool_position(position_mint: Pubkey) -> Result<()> {
+/// Закрывает позицию целиком (сбор комиссий + вывод ликвидности + close).
+pub async fn close_whirlpool_position(
+    position_mint: Pubkey,
+    slippage: u16,
+) -> anyhow::Result<()> {
     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-        .map_err(op("set_whirlpools_config_address"))?;
-    let rpc = utils::init_rpc();
-    let wallet = utils::load_wallet()?;
+    .map_err(op("set_whirlpools_config_address"))?;
+    let rpc     = utils::init_rpc();
+    let wallet  = utils::load_wallet()?;
     let wallet_pk = wallet.pubkey();
 
-    let quote = close_position_instructions(&rpc, position_mint, Some(100), Some(wallet_pk))
-        .await
+    // единый комплект Collect + Decrease + Close
+    let ClosePositionInstruction { instructions, additional_signers, .. } =
+        close_position_instructions(&rpc, position_mint, Some(slippage), Some(wallet_pk)).await
         .map_err(op("close_position_instructions"))?;
 
-    let mut signers = Vec::with_capacity(1 + quote.additional_signers.len());
-    signers.push(&wallet);
-    for kp in &quote.additional_signers {
-        signers.push(kp);
-    }
-
-    utils::send_and_confirm(rpc, quote.instructions, &signers)
-        .await
-        .map_err(op("send_and_confirm"))
+    let mut signers: Vec<&Keypair> = vec![&wallet];
+    signers.extend(additional_signers.iter());
+    utils::send_and_confirm(rpc, instructions, &signers).await?;
+    Ok(())
 }
+// pub async fn close_whirlpool_position(
+//     position_mint: Pubkey,
+//     slippage_bps: u16,
+// ) -> anyhow::Result<()> {
+//     // ─ 0. Init
+//     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
+//     .map_err(op("set_whirlpools_config_address"))?;
+//     let rpc        = utils::init_rpc();
+//     let wallet     = utils::load_wallet()?;
+//     let wallet_pk  = wallet.pubkey();
+
+//     // ─ 1. Читаем позицию; если уже закрыта — выходим
+//     let (pos_addr, _) = orca_whirlpools_client::get_position_address(&position_mint)?;
+//     let acc = match rpc.get_account(&pos_addr).await {
+//         Ok(a) => a,
+//         Err(_) => return Ok(()),                       // счёт уже удалён
+//     };
+//     let pos  = orca_whirlpools_client::Position::from_bytes(&acc.data)?;
+//     let pool = orca_whirlpools_client::Whirlpool::from_bytes(
+//         &rpc.get_account(&pos.whirlpool).await?.data)?;
+
+//     // ─ 2. Собираем инструкции «осушить»
+//     let mut instrs:         Vec<Instruction> = Vec::new();
+//     let mut extra_signers:  Vec<Keypair>     = Vec::new();   // ← владеем!
+//     let wallet_ref: &Keypair = &wallet;                     // удобная ссылка
+
+//     //---------------------------------------------------------------- a) DecreaseLiquidity (если нужно)
+//     if pos.liquidity > 0 {
+//         let DecreaseLiquidityInstruction { instructions, additional_signers, .. } =
+//             decrease_liquidity_instructions(
+//                 &rpc,
+//                 position_mint,
+//                 DecreaseLiquidityParam::Liquidity(pos.liquidity),
+//                 Some(slippage_bps.max(200)),
+//                 Some(wallet_pk),
+//             )
+//             .await
+//             .map_err(op("decrease_liquidity_instructions"))?;
+    
+//         instrs.extend(instructions);
+//         extra_signers.extend(additional_signers);           // перемещаем Keypair-ы
+//     }
+    
+
+//     //---------------------------------------------------------------- b) CollectFees (если нужно)
+//     if pos.fee_owed_a > 0 || pos.fee_owed_b > 0 {
+//         // ATA владельца под оба токена
+//         let ata_a = spl_associated_token_account::get_associated_token_address(
+//             &wallet_pk, &pool.token_mint_a);
+//         let ata_b = spl_associated_token_account::get_associated_token_address(
+//             &wallet_pk, &pool.token_mint_b);
+
+//         // счёт позиции-NFT
+//         let pos_token_account = spl_associated_token_account::get_associated_token_address(
+//             &wallet_pk, &position_mint);
+
+//         // токен-программы (обычный или 2022)
+//         let mint_infos = rpc.get_multiple_accounts(&[
+//             pool.token_mint_a,
+//             pool.token_mint_b,
+//         ]).await?;
+//         let prog_a = mint_infos[0].as_ref().unwrap().owner;
+//         let prog_b = mint_infos[1].as_ref().unwrap().owner;
+
+//         let collect_ix = CollectFeesV2 {
+//             whirlpool:            pos.whirlpool,
+//             position_authority:   wallet_pk,
+//             position:             pos_addr,
+//             position_token_account: pos_token_account,
+//             token_mint_a:         pool.token_mint_a,
+//             token_mint_b:         pool.token_mint_b,
+//             token_owner_account_a: ata_a,
+//             token_vault_a:        pool.token_vault_a,
+//             token_owner_account_b: ata_b,
+//             token_vault_b:        pool.token_vault_b,
+//             token_program_a:      prog_a,
+//             token_program_b:      prog_b,
+//             memo_program:         spl_memo::ID,
+//         }
+//         .instruction(CollectFeesV2InstructionArgs {
+//             remaining_accounts_info: None,
+//         });
+
+//         instrs.push(collect_ix);
+//     }
+
+//     //---------------------------------------------------------------- c) Отправляем «осушающую» tx
+//     if !instrs.is_empty() {
+//         // формируем &-ссылки *после* того, как extra_signers заполнен
+//         let mut sign_refs: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+//         sign_refs.push(wallet_ref);
+//         for kp in &extra_signers { sign_refs.push(kp); }
+    
+//         utils::send_and_confirm(rpc.clone(), instrs, &sign_refs).await?;
+//     }
+
+//     // ─ 3. Формируем и отправляем ClosePosition
+//     let ClosePositionInstruction { instructions: close_ix, additional_signers: add_sgn, .. } =
+//     close_position_instructions(&rpc, position_mint, None, Some(wallet_pk)).await
+//     .map_err(op("close_position_instructions"))?;
+
+//     let mut close_refs: Vec<&Keypair> = Vec::with_capacity(1 + add_sgn.len());
+//     close_refs.push(wallet_ref);
+//     for kp in &add_sgn { close_refs.push(kp); }
+
+//     utils::send_and_confirm(rpc, close_ix, &close_refs).await?;
+
+//     Ok(())
+// }
+
+
 
 /// Собирает комиссии и возвращает `CollectFeesQuote`.
 pub async fn harvest_whirlpool_position(position_mint: Pubkey) -> Result<CollectFeesQuote> {
@@ -224,52 +343,69 @@ pub async fn open_with_funds_check(
     price_high: f64,
     initial_amount_usdc: f64,
     pool: PoolConfig,
+    slippage: u16,
 ) -> Result<OpenPositionResult> {
-    // 1) Инициализация RPC, кошелька и SDK
-    let rpc      = utils::init_rpc();
-    let wallet   = utils::load_wallet()?;
-    let wallet_pk = wallet.pubkey();
-    log::debug!("debug: wallet = {}", wallet_pk);
+    //── 1. RPC / wallet ───────────────────────────────────────────────
+    let rpc        = utils::init_rpc();
+    let wallet     = utils::load_wallet()?;
+    let wallet_pk  = wallet.pubkey();
     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-        .map_err(|e| anyhow!("SDK config failed: {}", e))?;
-    log::debug!("debug: whirlpools sdk → Mainnet");
+    .map_err(|e| anyhow!("set_whirlpools_config_address failed: {e}"))?;
 
-    // 2) Загружаем пул и считаем текущую цену + депозиты в атомах
-    let whirl_pk = Pubkey::from_str(pool.pool_address)?;
-    let acct     = rpc.get_account(&whirl_pk).await?;
-    let whirl    = Whirlpool::from_bytes(&acct.data)?;
+    //── 2. пул / decimals / spacing ──────────────────────────────────
+    let whirl_pk  = Pubkey::from_str(pool.pool_address)?;
+    let whirl     = Whirlpool::from_bytes(&rpc.get_account(&whirl_pk).await?.data)?;
+    let dec_a     = pool.decimal_a as u8;
+    let dec_b     = pool.decimal_b as u8;
+    let spacing   = whirl.tick_spacing as i32;
 
-    let dec_a = pool.decimal_a as i32;
-    let dec_b = pool.decimal_b as i32;
+    //── 3. валидные тики / цены ──────────────────────────────────────
+    let (tick_l, tick_u) =
+        nearest_valid_ticks(price_low, price_high, spacing, dec_a, dec_b);
 
-    let price_sol_in_usdc = sqrt_price_to_price(
-        U128::from(whirl.sqrt_price),
-        dec_a as u8,
-        dec_b as u8,
-    );
-    if price_sol_in_usdc <= 0.0 {
-        return Err(anyhow!("Invalid pool price: {}", price_sol_in_usdc));
-    }
-    log::debug!("debug: price SOL→USDC = {:.6}", price_sol_in_usdc);
-    let slippage_bps = 100;
-    let deposit_b = ((initial_amount_usdc * 10f64.powi(dec_b) as f64) * (1.0 + slippage_bps as f64 / 10_000.0))
-    .round() as u64;
-    let deposit_a = ((initial_amount_usdc / price_sol_in_usdc) * 10f64.powi(dec_a)).round() as u64;
-    log::debug!(
-        "debug: deposit_a_atoms = {}, deposit_b_atoms = {}",
-        deposit_a, deposit_b
-    );
+    let price_low_aligned  = tick_index_to_price(tick_l, dec_a, dec_b);
+    let price_high_aligned = tick_index_to_price(tick_u,  dec_a, dec_b);
 
-    // Выбираем, какой токен вносить
-    let liquidity_param = if price_low > price_sol_in_usdc {
-        IncreaseLiquidityParam::TokenA(deposit_a)
-    } else if price_high < price_sol_in_usdc {
-        IncreaseLiquidityParam::TokenB(deposit_b)
+    //── 4. базовые депозиты (в атомах) ───────────────────────────────
+    let dep_usdc_atoms = (initial_amount_usdc * 1e6) as u64;
+    // эквивалент в SOL-атомах
+    let price_now = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+    let dep_sol_atoms  = ((initial_amount_usdc / price_now) * 10f64.powi(dec_a as i32)) as u64;
+
+    //── 5. выбираем liquidity_param по вашей логике ───────────────────
+    let liquidity_param = if price_low_aligned > price_now {
+        // ▸ диапазон выше рынка → 100 % SOL
+        IncreaseLiquidityParam::TokenA(dep_sol_atoms.max(1))
+    } else if price_high_aligned < price_now {
+        // ▸ диапазон ниже рынка → 100 % USDC
+        IncreaseLiquidityParam::TokenB(dep_usdc_atoms.max(1))
     } else {
-        IncreaseLiquidityParam::TokenB(deposit_b)
+        // ▸ диапазон перекрывает рынок → нужен BOTH
+        //    делаем двухшаговый quote (B-only → Liquidity)
+        let OpenPositionInstruction { quote: tmp, .. } =
+            open_position_instructions(
+                &rpc,
+                whirl_pk,
+                price_low_aligned,
+                price_high_aligned,
+                IncreaseLiquidityParam::TokenB(dep_usdc_atoms.max(1)),
+                None,
+                Some(wallet_pk),
+            )
+            .await
+            .map_err(|e| anyhow!("first quote failed: {e}"))?;
+
+        let liq = tmp.liquidity_delta.max(1);          // защита от 0
+        IncreaseLiquidityParam::Liquidity(liq)
     };
 
-    // Берём инструкции из SDK
+    //── 6. финальный open_position_instructions ──────────────────────
+    let slippage_bps = if matches!(liquidity_param, IncreaseLiquidityParam::Liquidity(_)) {
+        slippage.max(200)   // для «центра» ≥ 200 bps
+    } else {
+        slippage            // для крайних можно тот, что пришёл
+    };
+
     let OpenPositionInstruction {
         position_mint,
         quote: IncreaseLiquidityQuote { token_max_a, token_max_b, .. },
@@ -279,18 +415,14 @@ pub async fn open_with_funds_check(
     } = open_position_instructions(
             &rpc,
             whirl_pk,
-            price_low,
-            price_high,
+            price_low_aligned,
+            price_high_aligned,
             liquidity_param,
-            None,
+            Some(slippage_bps),
             Some(wallet_pk),
         )
         .await
-        .map_err(|e| anyhow!("open_position_instructions failed: {}", e))?;
-    log::debug!(
-        "debug: quote.token_max_a = {}, token_max_b = {}",
-        token_max_a, token_max_b
-    );
+        .map_err(|e| anyhow!("open_position_instructions failed: {e}"))?;
 
     // 3) Считаем, сколько нам нужно native SOL и USDC
     let need_sol  = token_max_a as f64 / 10f64.powi(pool.decimal_a as i32);
@@ -393,8 +525,8 @@ pub async fn open_with_funds_check(
 
     // 10) Всё готово — шлём ровно те же инструкции из SDK
     log::debug!("DEBUG: sending SDK instructions…");
-    let amount_wsol = token_max_a as f64 / 10f64.powi(dec_a);
-    let amount_usdc = token_max_b as f64 / 10f64.powi(dec_b);
+    let amount_wsol = token_max_a as f64 / 10f64.powi(dec_a as i32);
+    let amount_usdc = token_max_b as f64 / 10f64.powi(dec_b as i32);
     let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + additional_signers.len());
     signers.push(&wallet);
     for kp in &additional_signers { signers.push(kp); }
@@ -430,7 +562,7 @@ pub async fn list_positions_for_owner() -> Result<Vec<PositionOrBundle>> {
 }
 
 
-pub async fn close_all_positions() -> Result<()> {
+pub async fn close_all_positions(slippage: u16) -> Result<()> {
     // 1) Получаем все позиции
     let positions = list_positions_for_owner()
         .await
@@ -470,7 +602,7 @@ pub async fn close_all_positions() -> Result<()> {
                 );
 
                 // 3) Попытка закрыть позицию
-                if let Err(err) = close_whirlpool_position(mint).await {
+                if let Err(err) = close_whirlpool_position(mint, slippage).await {
                     log::error!(
                         "❌ Error closing position {}/{} (mint={}): {:?}",
                         slot, total, mint, err
@@ -498,4 +630,35 @@ pub async fn close_all_positions() -> Result<()> {
 
     log::debug!("🎉 All positions processed successfully.");
     Ok(())
+}
+
+pub fn nearest_valid_ticks(
+    price_low:  f64,
+    price_high: f64,
+    tick_spacing: i32,
+    dec_a: u8,
+    dec_b: u8,
+) -> (i32, i32) {
+    // округлитель
+    fn align_tick(idx: i32, spacing: i32, round_up: bool) -> i32 {
+        let rem = idx.rem_euclid(spacing);
+        if rem == 0 {
+            idx
+        } else if round_up {
+            idx + (spacing - rem)
+        } else {
+            idx - rem
+        }
+    }
+
+    let raw_l = price_to_tick_index(price_low,  dec_a, dec_b);
+    let raw_u = price_to_tick_index(price_high, dec_a, dec_b);
+
+    let mut tick_l = align_tick(raw_l, tick_spacing, false); // вниз
+    let mut tick_u = align_tick(raw_u, tick_spacing,  true); // вверх
+
+    if tick_l == tick_u {
+        tick_u += tick_spacing; // гарантируем Δtick > 0
+    }
+    (tick_l, tick_u)
 }

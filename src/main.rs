@@ -687,11 +687,11 @@ async fn main() -> Result<()> {
     let (tx_telegram, _commander) = telegram_service::tl_engine::start();
 
     // 2. start Hyperliquid hedge worker
-    let tx_hl = exchange::hl_engine::start()?;
+    // let tx_hl = exchange::hl_engine::start()?;
 
     // 3. orchestrator: infinite cycle
     loop {
-        if let Err(e) = orchestrator::orchestrator_cycle(&tx_telegram, &tx_hl).await {
+        if let Err(e) = orchestrator::orchestrator_cycle(&tx_telegram).await {
             eprintln!("[ERROR] orchestrator cycle failed: {:?}", e);
             let _ = tx_telegram.send(ServiceCommand::SendMessage(
                 format!("❌ Bot error: {:?}", e)
