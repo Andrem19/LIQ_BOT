@@ -6,6 +6,8 @@ use serde_json::json;
 use tracing::debug;
 use crate::wirlpool_services::net::http_client;
 
+const TG_MAX_LEN: usize = 4096;
+
 #[derive(Clone)]
 pub struct Telegram {
     client: Client,
@@ -38,15 +40,27 @@ impl Telegram {
 
     /// Отправка простого текста
     pub async fn send(&self, text: &str) -> Result<()> {
+        // 1. Усечение, чтобы не получить 400 Bad Request
+        let chopped = if text.len() > TG_MAX_LEN {
+            format!("{}…\n\n[✂ trimmed, original {} chars]",
+                    &text[..TG_MAX_LEN - 60],         // оставляем ~4 кБ − служебный хвост
+                    text.len())
+        } else {
+            text.to_owned()
+        };
+
+        // 2. Отправка
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let resp = self.client
             .post(&url)
-            .json(&json!({ "chat_id": self.chat_id, "text": text }))
+            .json(&json!({ "chat_id": self.chat_id, "text": chopped }))
             .send()
             .await?;
+
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body   = resp.text().await.unwrap_or_default();
         debug!(target="notify", %url, %status, %body);
+
         if !status.is_success() {
             bail!("Telegram API error: {} - {}", status, body);
         }

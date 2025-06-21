@@ -15,18 +15,12 @@ pub const WETH: &str = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"; // 8
 
 pub const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 pub const KEYPAIR_FILENAME: &str = "/home/jupiter/.config/solana/mainnet-id.json";
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(30);
-pub const REPORT_INTERVAL: Duration = Duration::from_secs(30 * 60); // 30 минут
 pub const OVR: f64 = 1.01;           // 0.3 % запас
-pub const SOL_BUFFER: f64 = 0.0001;
-pub const B_BUFFER_ATOMS:  u64 = 10_000;   
 pub const PCT_LIST_1: [f64; 4] = [0.002, 0.005, 0.014, 0.003];
-pub const PCT_LIST_2: [f64; 4] = [0.002, 0.005, 0.014, 0.003];
-pub const ATR_BORDER: f64 = 1.8;
 pub const WEIGHTS: [f64; 3] = [45.0, 40.0, 15.0];
-pub const TOTAL_USDC_SOLUSDC: f64 = 160.0;
-pub const USDC_SOLRAY: f64 = 60.0;
-pub const USDC_SOLwhETH: f64 = 60.0;
+pub const TOTAL_USDC_SOLUSDC: f64 = 140.0;
+pub const USDC_SOLRAY: f64 = 55.0;
+pub const USDC_SOLWETH: f64 = 55.0;
 
 
 pub const POOL: PoolConfig = PoolConfig {

@@ -10,6 +10,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 use crate::telegram_service::{telegram::Telegram, commands::Commander};
 use serde::Deserialize;
+use tokio::sync::Notify;
 use crate::telegram_service::registry::register_commands;
 /// Тип команд, которые внешние потоки могут отправлять в Telegram-модуль.
 #[derive(Debug)]
@@ -17,7 +18,7 @@ pub enum ServiceCommand {
     SendMessage(String),
 }
 
-pub fn start() -> (UnboundedSender<ServiceCommand>, Arc<Commander>) {
+pub fn start(close_ntf:  Arc<Notify>) -> (UnboundedSender<ServiceCommand>, Arc<Commander>) {
     dotenv::dotenv().ok();
 
     // 0) прочитаем переменные окружения
@@ -29,7 +30,7 @@ pub fn start() -> (UnboundedSender<ServiceCommand>, Arc<Commander>) {
     let (tx, rx)  = unbounded_channel::<ServiceCommand>();
 
     // 2) зарегистрируем все команды заранее
-    register_commands(commander.clone(), tx.clone());
+    register_commands(commander.clone(), tx.clone(), close_ntf.clone());
     let cmd = commander.clone();
     // 3) запускаем отдельный поток с собственным runtime
     thread::spawn(move || {

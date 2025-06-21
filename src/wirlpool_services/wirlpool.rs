@@ -1,137 +1,45 @@
 use anyhow::{anyhow, Result};
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
-    rpc_config::RpcSendTransactionConfig,
 };
 use anyhow::Context;
 use tokio::time::sleep;
 use spl_associated_token_account::get_associated_token_address;
-use spl_token::solana_program::program_pack::Pack;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
-    message::Message,
     pubkey::Pubkey,
-    signature::{read_keypair_file, Keypair, Signer},
-    transaction::Transaction,
+    signature::{Keypair, Signer},
 };
 use anyhow::bail;
 use crate::orca_logic::helpers::get_sol_price_usd;
 use orca_whirlpools::{
-    fetch_positions_for_owner, 
-    fetch_positions_in_whirlpool,
+    fetch_positions_for_owner,
     PositionOrBundle,
 };
 use orca_whirlpools::HydratedBundledPosition;
-use orca_whirlpools_client::CollectFeesV2InstructionArgs;
-use orca_whirlpools::DecreaseLiquidityParam;
-use orca_whirlpools_client::CollectFeesV2;
-use orca_whirlpools::decrease_liquidity_instructions;
-use orca_whirlpools::DecreaseLiquidityInstruction;
 use orca_whirlpools::ClosePositionInstruction;
-use solana_sdk::system_instruction;
-use spl_associated_token_account::instruction::create_associated_token_account;
-use spl_token::instruction::sync_native;
 use orca_whirlpools::OpenPositionInstruction;
 use orca_whirlpools_core::IncreaseLiquidityQuote;
-use crate::wirlpool_services::swap::SwapResult;
-use spl_token::state::Mint;
-use orca_whirlpools_client::{Whirlpool,Position, DecodedAccount};
+use orca_whirlpools_client::{Whirlpool};
 use orca_whirlpools_core::price_to_tick_index;
 use orca_whirlpools::{
     close_position_instructions, harvest_position_instructions, open_position_instructions,
     set_whirlpools_config_address, HarvestPositionInstruction, IncreaseLiquidityParam,
     WhirlpoolsConfigInput,
 };
-use crate::params::{WALLET_MUTEX, WSOL, USDC, OVR, SOL_BUFFER};
+use crate::utils::utils;
+use crate::params::{WALLET_MUTEX, USDC, OVR};
 use orca_whirlpools_core::tick_index_to_price;
 use orca_whirlpools_core::{CollectFeesQuote, U128, sqrt_price_to_price};
 use crate::wirlpool_services::swap::execute_swap_tokens;
-use crate::params;
 use crate::types::{PoolConfig, OpenPositionResult};
-use orca_whirlpools_client::ID;
+use crate::utils::op;
 
-const BUY_PAD: f64 = 1.01;
 
-/// Вспомогательная функция для единообразного маппинга ошибок.
-fn op<E: std::fmt::Display>(ctx: &'static str) -> impl FnOnce(E) -> anyhow::Error {
-    move |e| anyhow!("{} failed: {}", ctx, e)
-}
 const GAP_SOL:  f64 = 0.002;
 const GAP_B:    f64 = 0.02;
-const LAM_RESERVE: u64 = 3_000_000;                 // 0.003 SOL
-const RESERVE_SOL: f64 = LAM_RESERVE as f64 / 1e9;
 
-fn sol_free(lamports: u64) -> f64 {
-    lamports.saturating_sub(LAM_RESERVE) as f64 / 1e9
-}
-
-/// Общие утилиты: RPC, кошелек, отправка.
-pub mod utils {
-    use super::*;
-
-    pub fn init_rpc() -> Arc<RpcClient> {
-        let url = env::var("HELIUS_HTTP")
-            .or_else(|_| env::var("QUICKNODE_HTTP"))
-            .or_else(|_| env::var("ANKR_HTTP"))
-            .or_else(|_| env::var("CHAINSTACK_HTTP"))
-            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        Arc::new(RpcClient::new_with_commitment(url, CommitmentConfig::confirmed()))
-    }
-
-    pub fn load_wallet() -> Result<Keypair> {
-        read_keypair_file(params::KEYPAIR_FILENAME)
-            .map_err(op("load_wallet"))
-    }
-
-    pub async fn send_and_confirm(
-        rpc: Arc<RpcClient>,
-        mut instructions: Vec<Instruction>,
-        signers: &[&Keypair],
-    ) -> Result<()> {
-        // 1. ComputeBudget
-        instructions.insert(0, ComputeBudgetInstruction::set_compute_unit_limit(400_000));
-
-        // 2. Latest blockhash
-        let recent = rpc
-            .get_latest_blockhash()
-            .await
-            .map_err(op("get_latest_blockhash"))?;
-        // 3. Build & sign
-        let payer = signers
-            .get(0)
-            .ok_or_else(|| anyhow!("No payer signer"))?;
-        let message = Message::new(&instructions, Some(&payer.pubkey()));
-        let mut tx = Transaction::new_unsigned(message);
-        tx.try_sign(signers, recent).map_err(op("sign transaction"))?;
-        // 4. Send
-        let sig = rpc
-            .send_transaction_with_config(
-                &tx,
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentConfig::processed().commitment),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(op("send transaction"))?;
-        // 5. Confirm
-        for _ in 0..40 {
-            if let Some(status) = rpc.get_signature_status(&sig).await.map_err(op("get_signature_status"))? {
-                status.map_err(|e| anyhow!("transaction failed: {:?}", e))?;
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        Err(anyhow!("Timeout: tx {} not confirmed within 40s", sig))
-    }
-}
-
-/// Закрывает позицию; возвращает `()` при успехе.
 /// Закрывает позицию целиком (сбор комиссий + вывод ликвидности + close).
 pub async fn close_whirlpool_position(
     position_mint: Pubkey,
@@ -247,17 +155,26 @@ pub async fn open_with_funds_check_universal(
     pool: PoolConfig,
     slippage: u16,
 ) -> Result<OpenPositionResult> {
+    let gap_b = if pool.name == "RAY/SOL" || pool.name == "SOL/USDC" {
+        GAP_B
+    } else {
+        0.00002
+    };
     // ───────── 1. RPC / Wallet / SDK ───────────────────────────────────────
-    println!("{}-{}-{}-{}", price_low, price_high, initial_amount_b, slippage);
+
     let rpc       = utils::init_rpc();
     let _wallet_guard = WALLET_MUTEX.lock().await;
+
     let wallet    = utils::load_wallet()?;
     let wallet_pk = wallet.pubkey();
+
+
     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
         .map_err(|e| anyhow!("SDK config failed: {e}"))?;
 
     // ───────── 2. Пул, децималы, tick-spacing ──────────────────────────────
     let whirl_pk  = Pubkey::from_str(pool.pool_address)?;
+
     let whirl     = Whirlpool::from_bytes(&rpc.get_account(&whirl_pk).await?.data)?;
     let dec_a     = pool.decimal_a as u8;                // WSOL → 9
     let dec_b     = pool.decimal_b as u8;                // USDC(6) / RAY(6) / whETH(8)
@@ -265,6 +182,7 @@ pub async fn open_with_funds_check_universal(
 
     // ───────── 3. Валидные тики, выровненные цены ─────────────────────────
     let (tick_l, tick_u) = nearest_valid_ticks(price_low, price_high, spacing, dec_a, dec_b);
+
     let price_low_aligned  = tick_index_to_price(tick_l, dec_a, dec_b);
     let price_high_aligned = tick_index_to_price(tick_u, dec_a, dec_b);
 
@@ -274,17 +192,22 @@ pub async fn open_with_funds_check_universal(
 
     // цена WSOL (token A) в B, нужна для конвертации
     let price_a_in_b = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+
     // эквивалент token A в атомах
     let dep_a_atoms = ((initial_amount_b / price_a_in_b) * 10f64.powi(dec_a as i32)) as u64;
 
+
     // ───────── 5. Выбор liquidity_param ───────────────────────────────────
     let liquidity_param = if price_low_aligned > price_a_in_b {
+
         // диапазон выше рынка → 100 % SOL (A)
         IncreaseLiquidityParam::TokenA(dep_a_atoms.max(1))
     } else if price_high_aligned < price_a_in_b {
+
         // диапазон ниже рынка → 100 % токен B
         IncreaseLiquidityParam::TokenB(dep_b_atoms.max(1))
     } else {
+
         // диапазон пересекает рынок → сначала TokenB, потом Liquidity
         let OpenPositionInstruction { quote: q, .. } = open_position_instructions(
             &rpc,
@@ -297,6 +220,7 @@ pub async fn open_with_funds_check_universal(
         )
         .await
         .map_err(|e| anyhow!("first quote failed: {e}"))?;
+
         IncreaseLiquidityParam::Liquidity(q.liquidity_delta.max(1))
     };
 
@@ -306,7 +230,7 @@ pub async fn open_with_funds_check_universal(
     } else {
         slippage
     };
-
+    println!("DEBUG: using slippage_bps = {}", slippage_bps);
     let OpenPositionInstruction {
         position_mint,
         quote: IncreaseLiquidityQuote { token_max_a, token_max_b, .. },
@@ -324,11 +248,21 @@ pub async fn open_with_funds_check_universal(
         )
         .await
         .map_err(|e| anyhow!("open_position_instructions failed: {e}"))?;
+    println!(
+        "DEBUG: open_position_instructions returned — \
+         position_mint = {}, token_max_a = {}, token_max_b = {}, \
+         instructions_count = {}, additional_signers_count = {}",
+        position_mint, token_max_a, token_max_b,
+        instructions.len(), additional_signers.len()
+    );
 
     // ───────── 7. Сколько нужно токенов по факту ──────────────────────────
     let need_sol  = (token_max_a as f64 / 10f64.powi(dec_a as i32)) * OVR;
     let need_tokb = (token_max_b as f64 / 10f64.powi(dec_b as i32)) * OVR;
-    
+    println!(
+        "DEBUG: need_sol = {:.6}, need_tokb = {:.6}",
+        need_sol, need_tokb
+    );
 
     const RESERVE_LAMPORTS: u64 = 50_000_000;        // ≈ 0.050 SOL
     const RESERVE_SOL: f64     = RESERVE_LAMPORTS as f64 / 1e9;
@@ -344,46 +278,69 @@ pub async fn open_with_funds_check_universal(
         .and_then(|r| r.amount.parse::<u64>().ok())
         .map(|a| a as f64 / 10f64.powi(dec_b as i32))
         .unwrap_or(0.0);
+    println!(
+        "DEBUG: initial sol_free = {:.6}, tokb_free = {:.6}",
+        sol_free, tokb_free
+    );
     
     //---------------------------------------------------------------------
     // 9. Пополняем дефицит, не трогая резерв
     //---------------------------------------------------------------------
     let mut round = 0;
     while (need_sol  - sol_free  > GAP_SOL) ||
-          (need_tokb - tokb_free > GAP_B)
+          (need_tokb - tokb_free > gap_b)
     {
         round += 1;
-        if round > 2 { break }                          // страховка от цикла
+        println!("DEBUG: === round {} ===", round);
+        if round > 2 { 
+            println!("DEBUG: reached max rounds, breaking");
+            break 
+        }                          // страховка от цикла
         let mut changed = false;
     
         // ── a)  SOL
         if need_sol - sol_free > GAP_SOL {
             let miss = need_sol - sol_free;
             let cost_b = miss * price_a_in_b;
+            println!(
+                "DEBUG: a) miss_sol = {:.6}, price_a_in_b = {:.6}, cost_b = {:.6}, tokb_free = {:.6}",
+                miss, price_a_in_b, cost_b, tokb_free
+            );
     
-            if tokb_free - cost_b >= need_tokb + GAP_B {
+            if tokb_free - cost_b >= need_tokb + gap_b {
+                println!("DEBUG: executing swap B→SOL amount = {:.6}", cost_b * OVR);
                 execute_swap_tokens(pool.mint_b, pool.mint_a, cost_b * OVR).await?;
                 changed = true;
             } else {
                 let sol_usd  = get_sol_price_usd().await?;
                 let usdc_need = miss * sol_usd * OVR;
+                println!("DEBUG: executing swap USDC→SOL amount = {:.6}", usdc_need);
                 execute_swap_tokens(USDC, pool.mint_a, usdc_need).await?;
                 changed = true;
             }
         }
     
         // ── b)  token-B
-        if need_tokb - tokb_free > GAP_B {
+        if need_tokb - tokb_free > gap_b {
             let miss = need_tokb - tokb_free;
             let cost_sol = miss / price_a_in_b;
+            println!(
+                "DEBUG: b) miss_tokb = {:.6}, price_a_in_b = {:.6}, cost_sol = {:.6}, sol_free = {:.6}",
+                miss, price_a_in_b, cost_sol, sol_free
+            );
     
             if sol_free - cost_sol >= need_sol + GAP_SOL {
+                println!("DEBUG: executing swap SOL→B amount = {:.6}", cost_sol * OVR);
                 execute_swap_tokens(pool.mint_a, pool.mint_b, cost_sol * OVR).await?;
                 changed = true;
             } else if pool.mint_b != USDC {
                 let sol_usd  = get_sol_price_usd().await?;
                 let b_usd    = (1.0 / price_a_in_b) * sol_usd;
                 let usdc_need = miss * b_usd * OVR;
+                println!(
+                    "DEBUG: executing swap USDC→B amount = {:.6}",
+                    usdc_need
+                );
                 execute_swap_tokens(USDC, pool.mint_b, usdc_need).await?;
                 changed = true;
             }
@@ -396,6 +353,10 @@ pub async fn open_with_funds_check_universal(
             ).await?;
             sol_free = (s_now - RESERVE_SOL).max(0.0);
             tokb_free = b_now;
+            println!(
+                "DEBUG: updated sol_free = {:.6}, tokb_free = {:.6}",
+                sol_free, tokb_free
+            );
         } else {
             break;
         }
@@ -407,7 +368,7 @@ pub async fn open_with_funds_check_universal(
     if need_sol  - sol_free  > GAP_SOL {
         bail!("SOL всё ещё не хватает: need {:.6}, free {:.6}", need_sol, sol_free);
     }
-    if need_tokb - tokb_free > GAP_B {
+    if need_tokb - tokb_free > gap_b {
         bail!("Token-B всё ещё не хватает: need {:.6}, free {:.6}", need_tokb, tokb_free);
     }
     

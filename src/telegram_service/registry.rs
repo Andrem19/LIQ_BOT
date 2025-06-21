@@ -4,6 +4,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::telegram_service::commands::Commander;
 use crate::telegram_service::tl_engine::ServiceCommand;
 use crate::params::POOL;
+use tokio::sync::Notify;
 use crate::wirlpool_services::wirlpool::open_with_funds_check_universal;
 use crate::wirlpool_services::{
     get_info::fetch_pool_position_info,
@@ -19,7 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Регистрация всех телеграм-команд
-pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceCommand>) {
+pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceCommand>, close_ntf:  Arc<Notify>) {
     let tx = Arc::new(tx);
 
     {
@@ -40,8 +41,10 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
     
     commander.add_command(&["close", "all"], {
         let tx = Arc::clone(&tx);
+        let close_ntf = close_ntf.clone();
         move |_params| {
             let tx = Arc::clone(&tx);
+            let close_ntf = close_ntf.clone(); 
             async move {
                 // мгновенно информируем пользователя
                 let _ = tx.send(ServiceCommand::SendMessage(
@@ -63,9 +66,11 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                     ));
     
                     tokio::time::sleep(Duration::from_secs(2)).await;
+                    close_ntf.notify_waiters();
     
                     match list_positions_for_owner(None).await {
                         Ok(positions) if positions.is_empty() => {
+                            
                             let _ = tx_bg.send(ServiceCommand::SendMessage(
                                 "🎉 Все позиции успешно закрыты.".into(),
                             ));
@@ -133,7 +138,6 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
 
     // 1. bal all
     commander.add_command(&["bal", "all"], {
-        println!("bal all");
         let tx = Arc::clone(&tx);
         move |_params| {
             let tx = Arc::clone(&tx);
