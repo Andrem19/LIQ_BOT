@@ -10,288 +10,341 @@ use orca_whirlpools::PositionOrBundle;
 use orca_whirlpools_client::Whirlpool;
 use crate::types::PoolConfig;
 use std::time::Instant;
+use tokio::{sync::Mutex};
+use anyhow::bail;
 
-use crate::params::{RPC_URL, POOL, PCT_LIST_1, PCT_LIST_2, ATR_BORDER, WEIGHTS, TOTAL_USDC, KEYPAIR_FILENAME};
+use crate::params::{RPC_URL, POOL, PCT_LIST_1, PCT_LIST_2, ATR_BORDER, WEIGHTS, TOTAL_USDC_SOLUSDC, KEYPAIR_FILENAME};
 use crate::types::{LiqPosition, Role};
 use crate::orca_logic::helpers::{calc_bound_prices_struct, calc_range_allocation_struct};
-use crate::wirlpool_services::wirlpool::{open_with_funds_check, close_all_positions, list_positions_for_owner};
+use crate::wirlpool_services::wirlpool::{open_with_funds_check_universal, close_all_positions, list_positions_for_owner};
 use crate::wirlpool_services::get_info::fetch_pool_position_info;
 use crate::telegram_service::tl_engine::ServiceCommand;
 use crate::types::WorkerCommand;
 use tokio::sync::mpsc::UnboundedSender;
 use spl_token::state::Mint;
 use std::env;
+use crate::params::{WALLET_MUTEX, USDC};
+use crate::wirlpool_services::wirlpool::utils;
+use crate::types::PoolRuntimeInfo;
+use std::sync::Arc;
 use spl_token::solana_program::program_pack::Pack;
 use crate::exchange::helpers::get_atr_1h;
+use crate::orca_logic::helpers::get_sol_price_usd;
+use crate::wirlpool_services::wirlpool::close_whirlpool_position;
 
 
-pub async fn orchestrator_cycle(
-    tx_telegram: &UnboundedSender<ServiceCommand>
+
+//-------------------------------- helper -----------------------------------
+async fn close_and_report(
+    rpc: &RpcClient,
+    pool_cfg: &PoolConfig,
+    whirl_pk: Pubkey,
+    tx_tg: &UnboundedSender<ServiceCommand>,
 ) -> Result<()> {
-    let pool_address = env::var("POOL_ADDRESS")
-        .map_err(|e| anyhow!("Не удалось прочитать POOL_ADDRESS из .env: {}", e))?;
-    let pool_address_static: &'static str = Box::leak(pool_address.into_boxed_str());
+    // 1) закрываем все позиции ЭТОГО пула
+    close_all_positions(150, Some(whirl_pk)).await?;
 
-    let atr_1h = get_atr_1h("SOLUSDT", 400, 12, 14).await?;
-    let avg_atr_last3: f64 = atr_1h.iter().rev().take(3).copied().sum::<f64>() / 3.0;
-    println!("Average ATR over last 3 1h candles: {:.6}", avg_atr_last3);
-    let pct_list = if avg_atr_last3 > ATR_BORDER {
-        PCT_LIST_1
+    // 2) Балансы после закрытия
+    let _lock   = WALLET_MUTEX.lock().await;              // единый замок
+    let wallet  = utils::load_wallet()?;
+    let wallet_pk = wallet.pubkey();
+
+    let lamports = rpc.get_balance(&wallet_pk).await?;
+    let bal_sol  = lamports as f64 / 1e9;
+
+    let mint_b  = Pubkey::from_str(pool_cfg.mint_b)?;
+    let ata_b   = get_associated_token_address(&wallet_pk, &mint_b);
+    let bal_b   = rpc.get_token_account_balance(&ata_b)
+        .await?.amount.parse::<f64>()?
+        / 10f64.powi(pool_cfg.decimal_b as i32);
+
+    // 3) Конвертируем SOL в эквивалент токена B или USDC
+    let whirl    = orca_whirlpools_client::Whirlpool::from_bytes(
+        &rpc.get_account(&whirl_pk).await?.data)?;
+    let price_ab = orca_whirlpools_core::sqrt_price_to_price(
+        whirl.sqrt_price.into(),
+        pool_cfg.decimal_a as u8,
+        pool_cfg.decimal_b as u8,
+    );                       // price(B per A): сколько B за 1 SOL
+
+    let total_usd = if pool_cfg.mint_b == USDC {
+        bal_b + bal_sol * price_ab            // price_ab == USDC per SOL
     } else {
-        PCT_LIST_2
+        // для RAY/SOL считаем «через SOL»: всё в экв. доллары
+        // берём цену SOL-USD из биржи Jupiter (один HTTP-запрос)
+        let sol_usd: f64 = get_sol_price_usd().await?;
+        bal_b * price_ab * sol_usd  +  bal_sol * sol_usd
     };
 
-    // Клонируем вашу константу (PoolConfig), чтобы не портить глобальную
-    let mut pool_cfg = POOL.clone();
-    // и переопределяем поле
-    pool_cfg.pool_address = pool_address_static;
-    // --- 1. Предварительная проверка: нет ли старых позиций? ---
-    let existing = list_positions_for_owner().await?;
-    if !existing.is_empty() {
-        let _ = tx_telegram.send(ServiceCommand::SendMessage(
-            "⚠️ Перед открытием новых позиций нужно закрыть старые!".into()
+    // 4) отчёт
+    let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+        "🏦 {} закрыт.\n► SOL {:.6}\n► token B {:.6}\n► Всего ≈ ${:.2}",
+        pool_cfg.name, bal_sol, bal_b, total_usd
+    )));
+    Ok(())
+}
+
+
+pub async fn orchestrator_pool(
+    mut pool_cfg: PoolConfig,          // шаблон пула
+    capital_usd: f64,                  // общий размер “кошелька” под пул
+    pct_list: [f64; 4],                // как раньше (игнорируется для 1-диапаз.)
+    three_ranges: bool,                // true = SOL/USDC, false = RAY/SOL
+    tx_tg: UnboundedSender<ServiceCommand>,
+) -> Result<()> {
+    close_existing_owner_positions(&pool_cfg).await?;
+    // ───── 0. RPC / Whirlpool meta ───────────────────────────────────────
+    let rpc       = utils::init_rpc();
+    let whirl_pk  = Pubkey::from_str(pool_cfg.pool_address)?;
+    let whirl     = orca_whirlpools_client::Whirlpool::from_bytes(
+        &rpc.get_account(&whirl_pk).await?.data
+    )?;
+    let dec_a     = Mint::unpack(&rpc.get_account(&whirl.token_mint_a).await?.data)?.decimals;
+    let dec_b     = Mint::unpack(&rpc.get_account(&whirl.token_mint_b).await?.data)?.decimals;
+
+
+    // ───── 1. Текущая цена ───────────────────────────────────────────────
+    let mut start_time = Instant::now();
+    let price_raw = orca_whirlpools_core::sqrt_price_to_price(whirl.sqrt_price.into(), dec_a, dec_b);
+    let invert    = !three_ranges;          // false для SOL/USDC, true для RAY/SOL
+    let price_disp = if invert { 1.0 / price_raw } else { price_raw };
+    let mut price = norm_price(price_raw, invert);
+
+    // ───── 2. Формируем диапазоны / аллокации  ───────────────────────────
+    let mut upper_exit = 0.0;
+    let mut lower_exit = 0.0;
+
+    if three_ranges {
+        
+        /* === трёх-диапазонное открытие для SOL/USDC ==================== */
+        let bounds = calc_bound_prices_struct(price, &pct_list);
+        let allocs = calc_range_allocation_struct(price, &bounds, &WEIGHTS, capital_usd);
+        
+        let _ = tx_tg.send(ServiceCommand::SendMessage(
+            format!("🔔 Пытаюсь открыть 3 позиции SOL/USDC ({} USDC)…", capital_usd)
         ));
-        // tx_hl.send(WorkerCommand::Off)?;
-        close_all_positions(300).await?;
-        return Err(anyhow!("Есть непустые позиции, прерываю цикл"));
-    }
-
-    // --- 2. Fetch on‐chain price + расчёт диапазонов и аллокаций ---
-    let rpc = RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::confirmed());
-    let whirl_pk = Pubkey::from_str(&pool_cfg.pool_address)?;
-    let acct = rpc.get_account(&whirl_pk).await?;
-    let whirl = Whirlpool::from_bytes(&acct.data)?;
-    let da = Mint::unpack(&rpc.get_account(&whirl.token_mint_a).await?.data)?.decimals;
-    let db = Mint::unpack(&rpc.get_account(&whirl.token_mint_b).await?.data)?.decimals;
-    let price = orca_whirlpools_core::sqrt_price_to_price(whirl.sqrt_price.into(), da, db);
-
-    let bounds = calc_bound_prices_struct(price, &pct_list);
-    let allocs = calc_range_allocation_struct(price, &bounds, &WEIGHTS, TOTAL_USDC);
-
-    let _ = tx_telegram.send(ServiceCommand::SendMessage(
-        format!("🔔 Открытие 3 диапазонных позиций по цене {:.6} На сумму: {:.2} ATR: {:.2}", price, TOTAL_USDC, avg_atr_last3),
-    ));
-
-    // --- 3. Две попытки открытия с fallback-логикой ---
-    let mut sol_total: f64 = 0.0;
-    // будем хранить только (index, position_mint)
-    let mut minted: Vec<(usize, Pubkey)> = Vec::with_capacity(3);
-
-    let mut slippage: u16 = 100;
-
-    for attempt in 1..=2 {
-        for (idx, alloc) in allocs.iter().enumerate() {
-            // если эта позиция ещё не открыта — пробуем
-            if minted.iter().all(|&(i, _)| i != idx) {
-                let deposit = if idx == 1 {
-                    alloc.usdc_amount
-                } else {
-                    alloc.usdc_equivalent
-                };
-                
-                match open_with_funds_check(
+        
+        let mut minted: Vec<(usize, String)> = Vec::new();   // (index, mint)
+        let mut slippage = 150u16;
+        
+        'outer: for round in 1..=2 {                          // максимум 3 раунда
+            let mut progress = false;
+        
+            for (idx, alloc) in allocs.iter().enumerate() {
+                if minted.iter().any(|&(i, _)| i == idx) { continue } // уже есть
+        
+                let deposit = if idx == 1 { alloc.usdc_amount } else { alloc.usdc_equivalent };
+        
+                match open_with_funds_check_universal(
                     alloc.lower_price,
                     alloc.upper_price,
                     deposit,
                     pool_cfg.clone(),
-                    slippage
+                    slippage,
                 ).await {
                     Ok(res) => {
-                        sol_total += res.amount_wsol;
-                        minted.push((idx, res.position_mint));
-                        let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                            format!(
-                                "✅ [{}] открыт: mint {} (WSOL {:.6} / USDC {:.6})",
-                                alloc.range_type, res.position_mint, res.amount_wsol, res.amount_usdc
-                            ),
+                        // ↓ запоминаем открытую
+                        minted.push((idx, res.position_mint.to_string()));
+                        progress = true;
+        
+                        let liq = LiqPosition {
+                            role: [Role::Up, Role::Middle, Role::Down][idx].clone(),
+                            position_address: None,
+                            position_nft:     None,
+                            upper_price: alloc.upper_price,
+                            lower_price: alloc.lower_price,
+                        };
+                        match idx {
+                            0 => pool_cfg.position_1 = Some(liq),
+                            1 => pool_cfg.position_2 = Some(liq),
+                            _ => pool_cfg.position_3 = Some(liq),
+                        }
+        
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(
+                            format!("✅ Открыта P{} (mint {})", idx + 1, res.position_mint),
                         ));
                     }
                     Err(e) => {
-                        let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                            format!("❌ [{}] не открылся: {:?}", alloc.range_type, e)
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(
+                            format!("⚠️ P{} не открылась: {e}", idx + 1),
                         ));
                     }
                 }
-
-                sleep(Duration::from_secs(1)).await;
+        
+                // маленький «кул-даун», чтобы цепочка tx успела пройти
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             }
-        }
-
-        // даём блокчейну обновиться
-        sleep(Duration::from_secs(2)).await;
-
-        // Проверяем, сколько из трёх реально появились on‐chain
-        let positions = list_positions_for_owner().await?;
-        let got = positions.iter().filter_map(|pb| {
-            if let PositionOrBundle::Position(hp) = pb {
-                minted.iter()
-                    .find(|&&(_, m)| m == hp.data.position_mint)
-                    .map(|&(i, _)| i)
-            } else { None }
-        }).collect::<Vec<usize>>();
-
-        if got.len() == 3 {
-            break; // все три успешно открыты
-        }
-
-        if attempt == 1 {
-            let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                format!("⚠️ После первой попытки открыто {}/3, пробуем недостающие…", got.len())
+        
+            // если уже все 3 — выходим
+            if minted.len() == 3 { break 'outer; }
+        
+            // если не продвинулись — повышаем slippage
+            if !progress { slippage += 100; }
+        
+            let _ = tx_tg.send(ServiceCommand::SendMessage(
+                format!("🔄 Раунд {round} окончен, открыто {}/3. Slippage = {} bps", minted.len(), slippage)
             ));
-            slippage = 250;
-            sleep(Duration::from_secs(1)).await;
-        } else {
-            close_all_positions(150).await?;
-            let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                format!("❌ Не удалось открыть все 3 позиции (открыто {}). Была попытка их закрыть. Перерыв.", got.len())
-            ));
-            std::process::exit(1);
         }
+        
+        // окончательная проверка
+        if minted.len() != 3 {
+            let _ = tx_tg.send(ServiceCommand::SendMessage(
+                format!("❌ За 3 раунда открыто только {}/3. Закрываю то, что было.", minted.len())
+            ));
+        
+            for &(_, ref pm) in &minted {
+                let _ = close_whirlpool_position(Pubkey::from_str(pm)?, 150u16).await;
+            }
+            bail!("Не удалось открыть все три диапазона");
+        }
+        
+        upper_exit = pool_cfg.position_1.as_ref().unwrap().upper_price;
+        lower_exit = pool_cfg.position_3.as_ref().unwrap().lower_price;
+    } else {
+        // диапазон в удобном (SOL за RAY) виде
+        let low_disp  = price_disp * 0.995;
+        let high_disp = price_disp * 1.005;
+
+        let sol_usd  = get_sol_price_usd().await?;
+        let tok_b_usd  = price * sol_usd;          // USD-цена 1 RAY
+        let amount_tok_b = (capital_usd / 2.0) / tok_b_usd;
+
+        // -- вывод пользователю --
+        let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+            "🔔 Открываю центр {} [{:.6}; {:.6}], вес ${:.2} amount Tok_b: {:.2}",
+            pool_cfg.name, low_disp, high_disp, capital_usd, amount_tok_b
+        )));
+
+        // границы, которые нужны SDK (RAY за SOL)
+        let low_raw  = 1.0 / high_disp;
+        let high_raw = 1.0 / low_disp;
+
+        open_with_funds_check_universal(
+            low_raw,
+            high_raw,
+            amount_tok_b,          // как было
+            pool_cfg.clone(),
+            150,
+        ).await?;
+
+        pool_cfg.position_2 = Some(LiqPosition {
+            role:          Role::Middle,
+            position_address: None,
+            position_nft:     None,
+            upper_price: high_disp,     // храним и контролируем в display-виде
+            lower_price: low_disp,
+        });
+        upper_exit = high_disp;
+        lower_exit = low_disp;
     }
 
-    // --- 4. Формируем PoolConfig и запускаем хедж ---
-    let start_time = Instant::now();
-    let mut cfg: PoolConfig = pool_cfg.clone();
-    cfg.sol_init = sol_total;
 
-    let positions = list_positions_for_owner().await?;
-    for &(idx, mint) in &minted {
-        if let Some(hp) = positions.iter().find_map(|pb| {
-            if let PositionOrBundle::Position(hp) = pb {
-                if hp.data.position_mint == mint { Some(hp) } else { None }
-            } else { None }
-        }) {
-            let addr: &'static str = Box::leak(hp.address.to_string().into_boxed_str());
-            let nft:  &'static str = Box::leak(hp.data.position_mint.to_string().into_boxed_str());
-            let liq = LiqPosition {
-                role: match idx {
-                    0 => Role::Up,
-                    1 => Role::Middle,
-                    2 => Role::Down,
-                    _ => unreachable!(),
-                },
-                position_address: Some(addr),
-                position_nft:    Some(nft),
-                upper_price:     allocs[idx].upper_price,
-                lower_price:     allocs[idx].lower_price,
-            };
-            match idx {
-                0 => cfg.position_1 = Some(liq),
-                1 => cfg.position_2 = Some(liq),
-                2 => cfg.position_3 = Some(liq),
-                _ => {}
-            }
-        }
-    }
-
-    // tx_hl.send(WorkerCommand::On(cfg.clone()))?;
-
-    // --- 5. Мониторинг: отчёт каждые 5 мин, проверка цены каждые 30 сек ---
-    let upper_exit = cfg.position_1.as_ref().unwrap().upper_price;
-    let lower_exit = cfg.position_3.as_ref().unwrap().lower_price;
-    let mut report_interval = tokio::time::interval(Duration::from_secs(300));
-    let mut price_interval  = tokio::time::interval(Duration::from_secs(3));
+    // ───── 3. Мониторинг ────────────────────────────────────────────────
+    let mut price_itv  = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
-            // a) report
-            _ = report_interval.tick() => {
-                // 1) Сначала получаем актуальную on‐chain цену
-                let acct = rpc.get_account(&whirl_pk).await?;
-                let sqrt_p = orca_whirlpools_client::Whirlpool::from_bytes(&acct.data)?.sqrt_price.into();
-                let current_price = orca_whirlpools_core::sqrt_price_to_price(sqrt_p, da, db);
+            _ = price_itv.tick() => {
+                let curr_raw = orca_whirlpools_core::sqrt_price_to_price(
+                    orca_whirlpools_client::Whirlpool::from_bytes(
+                        &rpc.get_account(&whirl_pk).await?.data
+                    )?.sqrt_price.into(), dec_a, dec_b
+                );
+
+                price = norm_price(curr_raw, invert);
+
+                let kof = if pool_cfg.name != "SOL/USDC" {
+                    0.008
+                } else {
+                    0.0015
+                };
             
-                // 2) Собираем отчёт по каждой позиции, аккумулируем общую сумму
-                let mut report = format!("📊 Pool report — Price: {:.6}\n", current_price);
-                let mut total_value = 0.0;
-                for (i, opt) in [
-                    cfg.position_1.as_ref(),
-                    cfg.position_2.as_ref(),
-                    cfg.position_3.as_ref(),
-                ].iter().enumerate() {
-                    if let Some(lp) = opt {
-                        if let Ok(info) = fetch_pool_position_info(&cfg, lp.position_address).await {
-                            report.push_str(&format!(
-                                "Pos {}: Range [{:.6}–{:.6}], Total ${:.6}\n",
-                                i + 1,
-                                info.lower_price,
-                                info.upper_price,
-                                info.sum,
-                            ));
-                            total_value += info.sum;
-                        }
+                if price > upper_exit * (1.0+kof) || price < lower_exit * (1.0-kof) {
+                    let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+                        "⚠️ {}: price {:.6} вышла за [{:.6}; {:.6}] — закрываю позиции",
+                        pool_cfg.name, price, lower_exit, upper_exit
+                    )));
+            
+                    //   ⇓  новое вызванное действие
+                    if let Err(e) = close_and_report(&rpc, &pool_cfg, whirl_pk, &tx_tg).await {
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(
+                            format!("❌ Ошибка при закрытии {}: {:?}", pool_cfg.name, e)
+                        ));
                     }
+                    break;          // main перезапустит корутину
                 }
-            
-                // 3) Добавляем общий итог
-                report.push_str(&format!("— Всего по всем позициям: ${:.6}\n", total_value));
-            
-                let _ = tx_telegram.send(ServiceCommand::SendMessage(report));
             }
+            
+        }
+    }
 
-            // b) exit check
-            _ = price_interval.tick() => {
-                let acct = rpc.get_account(&whirl_pk).await?;
-                let sqrt_p = Whirlpool::from_bytes(&acct.data)?.sqrt_price.into();
-                let current = orca_whirlpools_core::sqrt_price_to_price(sqrt_p, da, db);
-            
-                if current >= upper_exit || current <= lower_exit {
-                    // вычисляем, сколько времени прошло с открытия
-                    let elapsed = start_time.elapsed();
-                    let secs = elapsed.as_secs();
-                    let hours = secs / 3600;
-                    let mins  = (secs % 3600) / 60;
-                    let secs  = secs % 60;
-            
-                    // шлём предупреждение с таймингом
-                    let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                        format!(
-                            "⚠️ Price {:.6} вышла за [{:.6}–{:.6}], закрываем…\n⏱️ Elapsed since open: {}h {}m {}s",
-                            current, lower_exit, upper_exit,
-                            hours, mins, secs,
-                        )
-                    ));
-            
-                    close_all_positions(150).await?;
-                    // tx_hl.send(WorkerCommand::Off)?;
-            
-                    // балансы после
-                    let keypair = read_keypair_file(KEYPAIR_FILENAME)
-                        .map_err(|e| anyhow!("read_keypair_file: {e}"))?;
-                    let wallet = keypair.pubkey();
-                    let lamports_total = rpc.get_balance(&wallet).await
-                        .map_err(|e| anyhow!("get_balance SOL failed: {}", e))?;
-                    let bal_sol = lamports_total as f64 / 1e9;
-                    let ata_usdc = get_associated_token_address(&wallet, &Pubkey::from_str(cfg.mint_b)?);
-                    let bal_usdc = rpc.get_token_account_balance(&ata_usdc).await?.amount.parse::<f64>()? / 1e6;
+    Ok(())
+}
 
-                    // on‐chain price again to convert SOL → USDC
-                    let acct       = rpc.get_account(&whirl_pk).await?;
-                    let whirl      = orca_whirlpools_client::Whirlpool::from_bytes(&acct.data)?;
-                    let mint_a_acct = rpc.get_account(&whirl.token_mint_a).await?;
-                    let mint_b_acct = rpc.get_account(&whirl.token_mint_b).await?;
-                    let da         = Mint::unpack(&mint_a_acct.data)?.decimals;
-                    let db         = Mint::unpack(&mint_b_acct.data)?.decimals;
-                    let price_now  = orca_whirlpools_core::sqrt_price_to_price(
-                        whirl.sqrt_price.into(), da, db
-                    );
 
-                    // общий баланс в USDC
-                    let total_usdc = bal_usdc + bal_sol * price_now;
+#[inline]
+fn norm_price(raw: f64, invert: bool) -> f64 {
+    if invert { 1.0 / raw } else { raw }
+}
 
-                    // финальный отчёт
-                    let _ = tx_telegram.send(ServiceCommand::SendMessage(
-                        format!(
-                            "🏦 After close — WSOL: {:.6}, USDC: {:.6}, Total in USDC: {:.6}",
-                            bal_sol, bal_usdc, total_usdc
-                        )
-                    ));
-            
-                    break;
-                }
+// reporter.rs
+pub async fn build_pool_report(cfg: &PoolConfig) -> anyhow::Result<String> {
+
+    let rpc = utils::init_rpc();
+    let whirl_pk = Pubkey::from_str(cfg.pool_address)?;
+    let whirl_acct = rpc.get_account(&whirl_pk).await?;
+    let whirl = orca_whirlpools_client::Whirlpool::from_bytes(&whirl_acct.data)?;
+
+    // текущая цена
+    let da = cfg.decimal_a;
+    let db = cfg.decimal_b;
+    let raw = orca_whirlpools_core::sqrt_price_to_price(whirl.sqrt_price.into(), da as u8, db as u8);
+    let price_disp = if cfg.name == "RAY/SOL" { 1.0 / raw } else { raw };
+
+    // все позиции owner-a в этом пуле
+    let list = list_positions_for_owner(Some(whirl_pk)).await?;  // ← ваша обёртка SDK
+    if list.is_empty() {
+        return Ok(format!("📊 {} — позиций нет.\n", cfg.name));
+    }
+
+    // собираем инфо по позициям
+    let mut infos = Vec::new();
+    for p in list {
+        if let PositionOrBundle::Position(hp) = p {
+            if let Ok(i) = fetch_pool_position_info(cfg, Some(&hp.address.to_string())).await {
+                infos.push(i);
             }
         }
     }
 
+    // сортируем по lower_price (чтобы 🍏🍊🍎 шли «сверху вниз»)
+    infos.sort_by(|a,b| a.lower_price.partial_cmp(&b.lower_price).unwrap());
+
+    // генерируем отчёт
+    let mut rep = format!("📊 {} — Price {:.6}\n", cfg.name, price_disp);
+    let icons = ["🍏","🍊","🍎"];
+    let mut total = 0.0;
+    for (idx, i) in infos.iter().enumerate() {
+        let sym = if price_disp > i.lower_price && price_disp < i.upper_price {
+            icons.get(idx).unwrap_or(&"✅")
+        } else { "----" };
+        rep.push_str(&format!(
+            "{}P{}: R[{:.4}–{:.4}], ${:.4}\n",
+            sym, idx+1, i.lower_price, i.upper_price, i.sum
+        ));
+        total += i.sum;
+    }
+    rep.push_str(&format!("— Всего: ${:.4}\n\n", total));
+    Ok(rep)
+}
+
+async fn close_existing_owner_positions(pool: &PoolConfig) -> anyhow::Result<()> {
+    let list = list_positions_for_owner(Some(Pubkey::from_str(pool.pool_address)?)).await?;
+    for p in list {
+        if let PositionOrBundle::Position(pos) = p {
+            // закрываем любую позицию owner-а в этом пуле
+            let _ = close_whirlpool_position(pos.data.position_mint, 150.0 as u16).await;
+        }
+    }
     Ok(())
 }

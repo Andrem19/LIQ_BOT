@@ -1,4 +1,21 @@
 use solana_sdk::pubkey::Pubkey;
+
+use serde::{Deserialize, Serialize};
+
+/// Снимок состояния пула, который читает `reporter()`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolRuntimeInfo {
+    pub name:        String,   // “SOL/USDC” или “RAY/SOL”
+    pub last_price:  f64,      // спотовая цена в quoted-формате (см. ниже)
+    pub fees_usd:    f64,      // накопленные комиссии (в USD экв.)
+}
+
+impl Default for PoolRuntimeInfo {
+    fn default() -> Self {
+        Self { name: String::new(), last_price: 0.0, fees_usd: 0.0 }
+    }
+}
+
 #[derive(Debug)]
 pub struct PoolPositionInfo {
     pub pending_a: f64,

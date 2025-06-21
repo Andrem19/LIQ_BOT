@@ -4,11 +4,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::telegram_service::commands::Commander;
 use crate::telegram_service::tl_engine::ServiceCommand;
 use crate::params::POOL;
+use crate::wirlpool_services::wirlpool::open_with_funds_check_universal;
 use crate::wirlpool_services::{
     get_info::fetch_pool_position_info,
-    wirlpool::{
-        open_with_funds_check,
-        harvest_whirlpool_position, summarize_harvest_fees,
+    wirlpool::{harvest_whirlpool_position, summarize_harvest_fees,
         close_whirlpool_position, close_all_positions, list_positions_for_owner
     },
 };
@@ -24,11 +23,11 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
     let tx = Arc::new(tx);
 
     {
-        let c = Arc::clone(&commander);
+        let c: Arc<Commander> = Arc::clone(&commander);
         let t = Arc::clone(&tx);
         commander.add_command(&["info"], move |_params| {
             let c2 = Arc::clone(&c);
-            let t2 = Arc::clone(&t);
+            let t2: Arc<UnboundedSender<ServiceCommand>> = Arc::clone(&t);
             async move {
                 let tree = c2.show_tree();
                 let _ = t2.send(ServiceCommand::SendMessage(
@@ -38,74 +37,103 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
         });
     }
 
-    {
+    
+    commander.add_command(&["close", "all"], {
         let tx = Arc::clone(&tx);
-        commander.add_command(&["close", "all"], move |_params| {
+        move |_params| {
             let tx = Arc::clone(&tx);
             async move {
-                // Начинаем процесс
+                // мгновенно информируем пользователя
                 let _ = tx.send(ServiceCommand::SendMessage(
-                    "🔒 Начинаем закрывать все позиции...".into(),
+                    "🔒 Начинаем закрывать ВСЕ позиции…".into(),
                 ));
-
-                // 1) Закрываем все позиции
-                if let Err(err) = close_all_positions(300).await {
-                    let _ = tx.send(ServiceCommand::SendMessage(format!(
-                        "❌ Ошибка при закрытии позиций: {:?}",
-                        err
-                    )));
-                } else {
-                    let _ = tx.send(ServiceCommand::SendMessage(
-                        "✅ Запросы на закрытие отправлены, дожидаемся подтверждения...".into(),
+    
+                // всё тяжёлое – в фоне
+                let tx_bg = Arc::clone(&tx);
+                tokio::spawn(async move {
+                    if let Err(err) = close_all_positions(300, None).await {
+                        let _ = tx_bg.send(ServiceCommand::SendMessage(
+                            format!("❌ Ошибка при закрытии позиций: {err:?}"),
+                        ));
+                        return;
+                    }
+    
+                    let _ = tx_bg.send(ServiceCommand::SendMessage(
+                        "✅ Запросы отправлены, ждём подтверждений…".into(),
                     ));
-                }
-
-                // 2) Ждём чуть-чуть, чтобы сеть и RPC подтянулися
-                sleep(Duration::from_secs(2)).await;
-
-                // 3) Проверяем, что осталось
-                match list_positions_for_owner().await {
-                    Ok(positions) => {
-                        if positions.is_empty() {
-                            let _ = tx.send(ServiceCommand::SendMessage(
+    
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+    
+                    match list_positions_for_owner(None).await {
+                        Ok(positions) if positions.is_empty() => {
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(
                                 "🎉 Все позиции успешно закрыты.".into(),
                             ));
-                        } else {
-                            // Формируем список оставшихся
-                            let mut msg = String::from("⚠️ Остались не закрытые позиции:\n");
+                        }
+                        Ok(positions) => {
+                            let mut msg = String::from("⚠️ Остались незакрытые позиции:\n");
                             for p in positions {
                                 match p {
-                                    PositionOrBundle::Position(hp) => {
-                                        msg.push_str(&format!(
-                                            "- mint: {}\n",
-                                            hp.data.position_mint
-                                        ));
-                                    }
-                                    PositionOrBundle::PositionBundle(pb) => {
-                                        msg.push_str(&format!(
-                                            "- bundle account: {}\n",
-                                            pb.address
-                                        ));
-                                    }
+                                    PositionOrBundle::Position(hp) =>
+                                        msg.push_str(&format!("- mint: {}\n",
+                                            hp.data.position_mint)),
+                                    PositionOrBundle::PositionBundle(pb) =>
+                                        msg.push_str(&format!("- bundle account: {}\n",
+                                            pb.address)),
                                 }
                             }
-                            let _ = tx.send(ServiceCommand::SendMessage(msg));
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(msg));
+                        }
+                        Err(err) => {
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(
+                                format!("❌ Ошибка при проверке позиций: {err:?}"),
+                            ));
                         }
                     }
-                    Err(err) => {
-                        let _ = tx.send(ServiceCommand::SendMessage(format!(
-                            "❌ Ошибка при проверке позиций: {:?}",
-                            err
-                        )));
-                    }
-                }
+                });
             }
-        });
-    }
+        }
+    });
+    
+    
+
+    
+    commander.add_command(&["close", "off"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                // первое сообщение – сразу
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "🔒 Закрываем все позиции и выключаемся…".into(),
+                ));
+    
+                // тяжёлую работу + завершение — в фоне
+                let tx_bg = Arc::clone(&tx);
+                tokio::spawn(async move {
+                    if let Err(err) = close_all_positions(300, None).await {
+                        let _ = tx_bg.send(ServiceCommand::SendMessage(
+                            format!("❌ Ошибка при закрытии позиций: {err:?}"),
+                        ));
+                    } else {
+                        let _ = tx_bg.send(ServiceCommand::SendMessage(
+                            "✅ Позиции закрыты, завершаем работу…".into(),
+                        ));
+                    }
+    
+                    // даём Telegram-циклу секунду, чтобы реально отправить сообщение
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                });
+            }
+        }
+    });
+    
 
 
     // 1. bal all
     commander.add_command(&["bal", "all"], {
+        println!("bal all");
         let tx = Arc::clone(&tx);
         move |_params| {
             let tx = Arc::clone(&tx);
@@ -153,7 +181,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                     let lower = cp * (1.0 - pct / 100.0);
                     let upper = cp * (1.0 + pct / 100.0);
 
-                    match open_with_funds_check(lower, upper, initial_amount_usdc, pool.clone(), 200).await {
+                    match open_with_funds_check_universal(lower, upper, initial_amount_usdc, pool.clone(), 200).await {
                         Ok(mint) => {
                             let _ = tx.send(ServiceCommand::SendMessage(
                                 format!(
