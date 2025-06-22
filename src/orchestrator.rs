@@ -8,6 +8,7 @@ use orca_whirlpools::PositionOrBundle;
 use crate::types::PoolConfig;
 use std::time::Instant;
 use std::sync::atomic::AtomicBool;
+use orca_whirlpools_core::U128;
 use anyhow::bail;
 use std::env;
 use dotenv::dotenv;
@@ -24,13 +25,14 @@ use crate::types::WorkerCommand;
 use tokio::sync::mpsc::UnboundedSender;
 use spl_token::state::Mint;
 use tokio::sync::Notify;
+use crate::database::triggers;
 
 use crate::params::{WALLET_MUTEX, USDC};
 use crate::utils::utils;
-use crate::utils::safe_get_account;
+use crate::utils::{safe_get_account, swap_excess_to_usdc};
 use crate::types::PoolRuntimeInfo;
 use std::sync::Arc;
-
+use crate::params::{WSOL};
 use spl_token::solana_program::program_pack::Pack;
 use crate::exchange::helpers::get_atr_1h;
 use crate::orca_logic::helpers::get_sol_price_usd;
@@ -44,9 +46,14 @@ async fn close_and_report(
     pool_cfg: &PoolConfig,
     whirl_pk: Pubkey,
     tx_tg: &UnboundedSender<ServiceCommand>,
+    lower: bool,
 ) -> Result<()> {
     // 1) закрываем все позиции ЭТОГО пула
     close_all_positions(150, Some(whirl_pk)).await?;
+    if lower {
+        _ = swap_excess_to_usdc(WSOL, 9, 0.05).await?;
+        triggers::auto_trade_switch(true, tx_tg).await?;
+    }
 
     // 2) Балансы после закрытия
     let _lock   = WALLET_MUTEX.lock().await;              // единый замок
@@ -97,6 +104,8 @@ pub async fn orchestrator_pool(
     tx_tg: UnboundedSender<ServiceCommand>,
     need_new: Arc<AtomicBool>,
     close_ntf:    Arc<Notify>,
+    min_restart: u64,
+    range: Option<f32>,
 ) -> Result<()> {
     let need_open_new = need_new.load(Ordering::SeqCst);
     need_new.store(true, Ordering::SeqCst);
@@ -212,8 +221,18 @@ pub async fn orchestrator_pool(
         lower_exit = pool_cfg.position_3.as_ref().unwrap().lower_price;
     } else if need_open_new {
         // ── 1. Текущие границы в “SOL за токен-B” (display) ─────────────────
-        let low_disp  = price_disp * 0.995;
-        let high_disp = price_disp * 1.005;
+
+        let (low_perc, high_perc) = match calculate_range(range) {
+            Some((low, high)) => (low, high),
+            None => {
+                println!("Не удалось вычислить диапазон");
+                return Ok(()); // или return Err(...), если в async fn
+            }
+        };
+        let low_disp  = low_perc * price_disp;
+        let high_disp = high_perc * price_disp;
+        println!("range: {} - {}", low_disp, high_disp);
+
 
         // ── 2. Цена 1 токена-B в SOL, а затем в USD ─────────────────────────
         let price_b_in_sol = price_disp;                 // invert всегда true здесь
@@ -277,7 +296,10 @@ pub async fn orchestrator_pool(
                 }
             }
         }
-        infos.sort_by(|a,b| a.lower_price.partial_cmp(&b.lower_price).unwrap());
+        infos.sort_by(|a, b| {
+            // теперь сравниваем сначала b с a
+            b.lower_price.partial_cmp(&a.lower_price).unwrap()
+        });
 
         // 3) заполняем pool_cfg и границы выхода
         if three_ranges {
@@ -328,18 +350,21 @@ pub async fn orchestrator_pool(
 
         // 4) информируем пользователя
         let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
-            "🔄 {}: найдено уже открытых позиций — переходим к мониторингу.\n\
-             Диапазон контроля [{:.6}; {:.6}]",
-            pool_cfg.name, lower_exit, upper_exit
+            "🔄 {}: найдено уже открытых позиций {:} — переходим к мониторингу",
+            pool_cfg.name, infos.len()
         )));
     }
 
 
     // ───── 3. Мониторинг ────────────────────────────────────────────────
-    let mut price_itv  = tokio::time::interval(Duration::from_secs(5));
+    let mut price_itv  = tokio::time::interval(Duration::from_secs(15));
 
     let mut out_of_range_since: Option<Instant> = None;       // только для «однодиапазонных»
-    const WAIT_BEFORE_REDEPLOY: Duration = Duration::from_secs(3600);   // 1 ч
+    let mut wait_before_redeploy = if pool_cfg.name == "SOL/USDC" {
+        Duration::from_secs(min_restart * 60)
+    } else {
+        Duration::from_secs(min_restart * 60)
+    };
 
     loop {
         tokio::select! {
@@ -357,50 +382,62 @@ pub async fn orchestrator_pool(
                     orca_whirlpools_client::Whirlpool::from_bytes(&acct.data)?.sqrt_price.into(),
                     dec_a, dec_b
                 );
+                let invert = if pool_cfg.name != "SOL/USDC" {true} else {false};
                 price = norm_price(curr_raw, invert);
 
                 // 3.2 допустимое отклонение
-                let kof = if pool_cfg.name != "SOL/USDC" { 0.008 } else { 0.0015 };
-                let out_of_range = price > upper_exit * (1.0 + kof) ||
-                                price < lower_exit * (1.0 - kof);
+                let kof = 0.0015;
 
-                // ── A)  пул SOL/USDC — закрываем немедленно ─────────────────
-                if pool_cfg.name == "SOL/USDC" {
-                    if out_of_range {
-                        let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
-                            "⚠️ {}: price {:.6} вышла за [{:.6}; {:.6}] — закрываю позиции",
-                            pool_cfg.name, price, lower_exit, upper_exit
-                        )));
-                        if let Err(e) = close_and_report(&rpc, &pool_cfg, whirl_pk, &tx_tg).await {
-                            let _ = tx_tg.send(ServiceCommand::SendMessage(
-                                format!("❌ Ошибка при закрытии {}: {:?}", pool_cfg.name, e)
-                            ));
-                        }
-                        break;      // run_pool_with_restart запустит всё заново
-                    }
-                    continue;       // переходим к следующему tick
-                }
+
+                let out_of_range = price > upper_exit * (1.0 + kof) ||
+                                price < lower_exit;
+
+                // println!(
+                //     "⚠️ {}: price {:.6} [{:.6}; {:.6}].",
+                //     pool_cfg.name, price, lower_exit, upper_exit
+                // );
+
+                // // ── A)  пул SOL/USDC — закрываем немедленно ─────────────────
+                // if pool_cfg.name == "SOL/USDC" {
+                //     if out_of_range {
+                //         let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+                //             "⚠️ {}: price {:.6} вышла за [{:.6}; {:.6}] — закрываю позиции",
+                //             pool_cfg.name, price, upper_exit, upper_exit
+                //         )));
+                //         if let Err(e) = close_and_report(&rpc, &pool_cfg, whirl_pk, &tx_tg).await {
+                //             let _ = tx_tg.send(ServiceCommand::SendMessage(
+                //                 format!("❌ Ошибка при закрытии {}: {:?}", pool_cfg.name, e)
+                //             ));
+                //         }
+                //         break;      // run_pool_with_restart запустит всё заново
+                //     }
+                //     continue;       // переходим к следующему tick
+                // }
 
                 // ── B)  все остальные пулы — ждём 1 ч, вернётся ли цена ──────
                 if out_of_range {
+                    if price < lower_exit {
+                        wait_before_redeploy = Duration::from_secs(0);
+                    }
                     match out_of_range_since {
                         // первый выход за границы — запускаем таймер
                         None => {
                             out_of_range_since = Some(Instant::now());
                             let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
                                 "⚠️ {}: price {:.6} вышла за [{:.6}; {:.6}]. \
-                                Ждём 1 ч, вдруг вернётся…",
-                                pool_cfg.name, price, lower_exit, upper_exit
+                                Ждём {:.2} min",
+                                pool_cfg.name, price, lower_exit, upper_exit, min_restart
                             )));
                         }
                         // таймер уже идёт — проверяем, истёк ли час
-                        Some(t0) if t0.elapsed() >= WAIT_BEFORE_REDEPLOY => {
+                        Some(t0) if t0.elapsed() >= wait_before_redeploy => {
                             let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
-                                "⏰ {}: прошло 1 ч, цена {:.6} всё ещё вне диапазона — \
+                                "⏰ {}: прошло {:.2} min, цена {:.6} всё ещё вне диапазона — \
                                 перевыставляем позиции",
-                                pool_cfg.name, price
+                                pool_cfg.name, min_restart, price
                             )));
-                            if let Err(e) = close_and_report(&rpc, &pool_cfg, whirl_pk, &tx_tg).await {
+                            let lower = if price < lower_exit { true } else { false };
+                            if let Err(e) = close_and_report(&rpc, &pool_cfg, whirl_pk, &tx_tg, lower).await {
                                 let _ = tx_tg.send(ServiceCommand::SendMessage(
                                     format!("❌ Ошибка при закрытии {}: {:?}", pool_cfg.name, e)
                                 ));
@@ -438,28 +475,33 @@ pub async fn orchestrator_pool(
 fn norm_price(raw: f64, invert: bool) -> f64 {
     if invert { 1.0 / raw } else { raw }
 }
-
+pub struct PoolReport {
+    pub text:   String, // готовый текст для Telegram
+    pub total:  f64,    // итоговая $-стоимость позиций
+}
 // reporter.rs
-pub async fn build_pool_report(cfg: &PoolConfig) -> anyhow::Result<String> {
-
-    let rpc = utils::init_rpc();
+pub async fn build_pool_report(cfg: &PoolConfig) -> Result<PoolReport> {
+    // 1. RPC / Whirlpool
+    let rpc      = utils::init_rpc();
     let whirl_pk = Pubkey::from_str(cfg.pool_address)?;
-    let whirl_acct = safe_get_account(&rpc, &whirl_pk).await?;
-    let whirl = orca_whirlpools_client::Whirlpool::from_bytes(&whirl_acct.data)?;
+    let whirl_ac = safe_get_account(&rpc, &whirl_pk).await?;
+    let whirl    = orca_whirlpools_client::Whirlpool::from_bytes(&whirl_ac.data)?;
 
-    // текущая цена
-    let da = cfg.decimal_a;
-    let db = cfg.decimal_b;
-    let raw = orca_whirlpools_core::sqrt_price_to_price(whirl.sqrt_price.into(), da as u8, db as u8);
-    let price_disp = if cfg.name != "SOL/USDC"{ 1.0 / raw } else { raw };
+    // 2. Текущая цена
+    let raw = orca_whirlpools_core::sqrt_price_to_price(U128::from(whirl.sqrt_price),
+                                  cfg.decimal_a as u8, cfg.decimal_b as u8);
+    let price_disp = if cfg.name.starts_with("SOL/") { raw } else { 1.0 / raw };
 
-    // все позиции owner-a в этом пуле
-    let list = list_positions_for_owner(Some(whirl_pk)).await?;  // ← ваша обёртка SDK
+    // 3. Все позиции владельца
+    let list = list_positions_for_owner(Some(whirl_pk)).await?;
     if list.is_empty() {
-        return Ok(format!("📊 {} — позиций нет.\n", cfg.name));
+        return Ok(PoolReport{
+            text:  format!("📊 {} — позиций нет.\n", cfg.name),
+            total: 0.0,
+        });
     }
 
-    // собираем инфо по позициям
+    // 4. Информация по позициям
     let mut infos = Vec::new();
     for p in list {
         if let PositionOrBundle::Position(hp) = p {
@@ -468,26 +510,27 @@ pub async fn build_pool_report(cfg: &PoolConfig) -> anyhow::Result<String> {
             }
         }
     }
+    infos.sort_by(|a, b| b.lower_price.partial_cmp(&a.lower_price).unwrap());
 
-    // сортируем по lower_price (чтобы 🍏🍊🍎 шли «сверху вниз»)
-    infos.sort_by(|a,b| a.lower_price.partial_cmp(&b.lower_price).unwrap());
-
-    // генерируем отчёт
-    let mut rep = format!("📊 {} — Price {:.6}\n", cfg.name, price_disp);
+    // 5. Формируем текст и суммируем total
     let icons = ["🍏","🍊","🍎"];
+    let mut txt   = format!("📊 {} — Price {:.6}\n", cfg.name, price_disp);
     let mut total = 0.0;
+    let mut tv    = 0.0;
+
     for (idx, i) in infos.iter().enumerate() {
-        let sym = if price_disp > i.lower_price && price_disp < i.upper_price {
+        let l = if cfg.name == "SOL/USDT" { 1.0/i.upper_price } else { i.lower_price };
+        let u = if cfg.name == "SOL/USDT" { 1.0/i.lower_price } else { i.upper_price };
+        let mark = if price_disp > l && price_disp < u {
             icons.get(idx).unwrap_or(&"✅")
         } else { "----" };
-        rep.push_str(&format!(
-            "{}P{}: R[{:.4}–{:.4}], ${:.4}\n",
-            sym, idx+1, i.lower_price, i.upper_price, i.sum
-        ));
+        txt.push_str(&format!("{mark}P{}: R[{:.4}–{:.4}], ${:.4}\n", idx+1, l, u, i.sum));
         total += i.sum;
+        tv    += i.value_a + i.value_b;
     }
-    rep.push_str(&format!("— Всего: ${:.4}\n\n", total));
-    Ok(rep)
+    txt.push_str(&format!("— TV: {:.2}\n— Всего: ${:.4}\n\n", tv, total));
+
+    Ok(PoolReport { text: txt, total })
 }
 
 async fn close_existing_owner_positions(pool: &PoolConfig) -> anyhow::Result<()> {
@@ -501,3 +544,14 @@ async fn close_existing_owner_positions(pool: &PoolConfig) -> anyhow::Result<()>
     Ok(())
 }
 
+pub fn calculate_range(range: Option<f32>) -> Option<(f64, f64)>{
+    let value = match range {
+        Some(v) => v,
+        None => {
+            println!("Значение отсутствует");
+            return None;
+        }
+    };
+    let half = value /2.0;
+    Some((1.0-half as f64, 1.0+half as f64))
+}

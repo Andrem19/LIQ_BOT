@@ -1,9 +1,10 @@
 // src/telegram_service/registry.rs
 
+use solana_sdk::signature::Keypair;
 use tokio::sync::mpsc::UnboundedSender;
 use crate::telegram_service::commands::Commander;
 use crate::telegram_service::tl_engine::ServiceCommand;
-use crate::params::POOL;
+use crate::params::{POOL, WETH, WBTC, WSOL, USDC};
 use tokio::sync::Notify;
 use crate::wirlpool_services::wirlpool::open_with_funds_check_universal;
 use crate::wirlpool_services::{
@@ -12,12 +13,17 @@ use crate::wirlpool_services::{
         close_whirlpool_position, close_all_positions, list_positions_for_owner
     },
 };
+use orca_tx_sender::Signer;
+use crate::database::triggers;
+use anyhow::anyhow;
 use orca_whirlpools::PositionOrBundle;
 use tokio::time::sleep;
+use crate::utils::{self, sweep_dust_to_usdc};
 use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
+use crate::database::triggers::Trigger;
 
 /// Регистрация всех телеграм-команд
 pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceCommand>, close_ntf:  Arc<Notify>) {
@@ -37,6 +43,175 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
             }
         });
     }
+
+    commander.add_command(&["on"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                // Выключаем флаг в БД
+                let mut t = Trigger {
+                    name: "auto_trade".into(),
+                    state: false,
+                    position: "opening".into(),
+                };
+                match triggers::upsert_trigger(&t).await {
+                    Ok(_) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            "✅ Trigger `auto_trade` on".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            format!("❌ Failed to on trigger: {}", e),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+
+    commander.add_command(&["off"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                let mut t = Trigger {
+                    name: "auto_trade".into(),
+                    state: true,
+                    position: "opening".into(),
+                };
+                match triggers::upsert_trigger(&t).await {
+                    Ok(_) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            "✅ Trigger `auto_trade` enabled".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            format!("❌ Failed to enable trigger: {}", e),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+
+    commander.add_command(&["safe"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            async move {
+                match utils::swap_excess_to_usdc(WSOL, 9, 0.05).await {
+                    Ok(report) => { let _ = tx.send(ServiceCommand::SendMessage(report)); }
+                    Err(e)     => { let _ = tx.send(ServiceCommand::SendMessage(format!("Error: {e}"))); }
+                }
+            }
+        }
+    });
+
+    commander.add_command(&["swap", "dust"], {
+        let tx = Arc::clone(&tx);
+        move |_params| {
+            let tx = Arc::clone(&tx);
+
+            // «пыль», которую хотим обменять на USDC.
+            // Можно свободно добавлять новые (mint, decimals).
+            const DUST_TOKENS: [(&str, u8); 2] = [
+                (WETH, 8),
+                (WBTC, 8),
+            ];
+
+            async move {
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "🔄 Ищу «пыль» (WETH, WBTC)…".into(),
+                ));
+
+                match sweep_dust_to_usdc(&DUST_TOKENS).await {
+                    Ok(report) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(report));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(ServiceCommand::SendMessage(
+                            format!("❌ Ошибка при свипе пыли: {err:?}"),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+
+    commander.add_command(&["close", "on"], {
+        let tx = Arc::clone(&tx);
+        let close_ntf = close_ntf.clone();
+        move |_params| {
+            let tx = Arc::clone(&tx);
+            let close_ntf = close_ntf.clone(); 
+            async move {
+                // мгновенно информируем пользователя
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "🔒 Начинаем закрывать ВСЕ позиции…".into(),
+                ));
+    
+                // всё тяжёлое – в фоне
+                let tx_bg = Arc::clone(&tx);
+                tokio::spawn(async move {
+                    if let Err(err) = close_all_positions(300, None).await {
+                        let _ = tx_bg.send(ServiceCommand::SendMessage(
+                            format!("❌ Ошибка при закрытии позиций: {err:?}"),
+                        ));
+                        return;
+                    }
+    
+                    let _ = tx_bg.send(ServiceCommand::SendMessage(
+                        "✅ Запросы отправлены, ждём подтверждений…".into(),
+                    ));
+    
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    close_ntf.notify_waiters();
+    
+                    match list_positions_for_owner(None).await {
+                        Ok(positions) if positions.is_empty() => {
+                            
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(
+                                "🎉 Все позиции успешно закрыты.".into(),
+                            ));
+
+                            let mut t = Trigger {
+                                name: "auto_trade".into(),
+                                state: true,
+                                position: "opening".into(),
+                            };
+                            let t = triggers::upsert_trigger(&t).await;
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+
+                        }
+                        Ok(positions) => {
+                            let mut msg = String::from("⚠️ Остались незакрытые позиции:\n");
+                            for p in positions {
+                                match p {
+                                    PositionOrBundle::Position(hp) =>
+                                        msg.push_str(&format!("- mint: {}\n",
+                                            hp.data.position_mint)),
+                                    PositionOrBundle::PositionBundle(pb) =>
+                                        msg.push_str(&format!("- bundle account: {}\n",
+                                            pb.address)),
+                                }
+                            }
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(msg));
+                        }
+                        Err(err) => {
+                            let _ = tx_bg.send(ServiceCommand::SendMessage(
+                                format!("❌ Ошибка при проверке позиций: {err:?}"),
+                            ));
+                        }
+                    }
+                });
+            }
+        }
+    });
+    
+
 
     
     commander.add_command(&["close", "all"], {
@@ -74,6 +249,7 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                             let _ = tx_bg.send(ServiceCommand::SendMessage(
                                 "🎉 Все позиции успешно закрыты.".into(),
                             ));
+                            tokio::time::sleep(Duration::from_secs(10)).await;
                         }
                         Ok(positions) => {
                             let mut msg = String::from("⚠️ Остались незакрытые позиции:\n");
@@ -121,13 +297,44 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                             format!("❌ Ошибка при закрытии позиций: {err:?}"),
                         ));
                     } else {
-                        let _ = tx_bg.send(ServiceCommand::SendMessage(
-                            "✅ Позиции закрыты, завершаем работу…".into(),
-                        ));
+                        let rpc = &utils::utils::init_rpc();
+                        let payer = match utils::utils::load_wallet() {
+                            Ok(kp) => kp,
+                            Err(e) => {
+                                let _ = tx_bg.send(ServiceCommand::SendMessage(
+                                    format!("❌ Не удалось загрузить кошелёк: {e}"),
+                                ));
+                                return; // прекращаем работу в этом фоне
+                            }
+                        };
+                        let wallet: Pubkey  = payer.pubkey();
+                        const TOKENS: [(&str, u8); 2] = [
+                            (WSOL, 9),
+                            (USDC, 6),
+                        ];
+                        let balances = match utils::balances_for_mints(&rpc, &wallet, &TOKENS).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx_bg.send(ServiceCommand::SendMessage(
+                                    format!("❌ Ошибка при получении балансов: {e}"),
+                                ));
+                                return;
+                            }
+                        };
+
+                        let mut report = String::from("✅ Позиции закрыты. Текущие балансы:\n");
+                        if balances.is_empty() {
+                            report.push_str("  — все остатки равны нулю.\n");
+                        } else {
+                            for (mint, _dec, bal) in balances {
+                                report.push_str(&format!("  • {}: {:.6}\n", mint, bal));
+                            }
+                        }
+                        let _ = tx_bg.send(ServiceCommand::SendMessage(report));
                     }
     
                     // даём Telegram-циклу секунду, чтобы реально отправить сообщение
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                     std::process::exit(0);
                 });
             }
@@ -445,3 +652,5 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
 
 
 }
+
+

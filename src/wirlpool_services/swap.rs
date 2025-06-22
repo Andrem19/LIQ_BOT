@@ -2,7 +2,7 @@
 //! С учётом исправления тела запроса к /swap.
 
 use std::str::FromStr;
-use crate::params::{USDC,WSOL,RAY,WETH, KEYPAIR_FILENAME, RPC_URL};
+use crate::params::{USDC,WSOL,WBTC,RAY,WETH,USDT,KEYPAIR_FILENAME, RPC_URL};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{self, Value};
 use solana_client::{
@@ -16,7 +16,6 @@ use spl_associated_token_account::get_associated_token_address;
 use crate::wirlpool_services::net::http_client;
 
 pub const MIN_SWAP_ATOMS: u64  = 10_000;   // ≈ 0.00001 token
-const LAM_RESERVE_LAMPORTS: u64 = 3_000_000;
 
 pub async fn execute_swap_tokens(
     sell_mint: &str,
@@ -32,6 +31,8 @@ pub async fn execute_swap_tokens(
             USDC => (Pubkey::from_str(USDC)?, 6),
             RAY  => (Pubkey::from_str(RAY )?, 6),
             WETH => (Pubkey::from_str(WETH)?, 8),
+            WBTC => (Pubkey::from_str(WBTC)?, 8),
+            USDT => (Pubkey::from_str(USDT)?, 6),
             _    => bail!("mint {m} не поддерживается")
         })
     }
@@ -72,7 +73,7 @@ pub async fn execute_swap_tokens(
 
     // ─── 3. две попытки:  50 bps  → 150 bps ─────────────────────────────
     let mut retry = 0;
-    for slippage_bps in [40_u16, 120_u16, 300_u16] {
+    for slippage_bps in [40_u16, 120_u16, 500_u16] {
         const GOOD_DEXES:  [&str; 3] = ["Raydium", "Orca", "Meteora"];
         let url = format!(
             "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false",
@@ -154,20 +155,3 @@ pub struct SwapResult {
     pub balance_buy:  f64,
 }
 
-/// Получить баланс токена (u64) по ATA.
-fn get_token_balance_u64(rpc: &RpcClient, ata: &Pubkey) -> Result<u64> {
-    Ok(rpc
-        .get_token_account_balance(ata)?
-        .amount
-        .parse::<u64>()?)
-}
-
-fn mint_info(m: &str) -> Result<(Pubkey,u8)> {
-    Ok(match m {
-        WSOL => (Pubkey::from_str(WSOL)?, 9),
-        USDC => (Pubkey::from_str(USDC)?, 6),
-        RAY  => (Pubkey::from_str(RAY )?, 6),
-        WETH => (Pubkey::from_str(WETH)?, 8),
-        _    => bail!("mint {m} не поддерживается")
-    })
-}

@@ -358,8 +358,8 @@ fn main() {
 
     // === Уровни границ (3 вверх, 3 вниз → 6 границ) ===
     let pct_list: Vec<f64> = vec![
-        0.002, 0.014,  // три «вверх»
-        0.005, 0.003,  // три «вниз»
+        0.005, 0.003,  // три «вверх»
+        0.002, 0.014,  // три «вниз»
     ];
 
     // 1) Считаем все границы
@@ -376,7 +376,7 @@ fn main() {
 
     // === Одиночный тест с равными весами ===
     // let eq_weight = 100.0 / (n_ranges as f64);
-    let weights_eq: Vec<f64> = vec![10.0,25.0,65.0];
+    let weights_eq: Vec<f64> = vec![65.0,25.0,10.0];
     println!("\nSingle-test weights: {:?}", weights_eq);
 
     let allocs = calc_range_allocation_struct(base_price, &bounds, &weights_eq, total_usdc);

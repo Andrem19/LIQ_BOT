@@ -24,7 +24,7 @@ use orca_whirlpools_core::IncreaseLiquidityQuote;
 use orca_whirlpools_client::{Whirlpool};
 use orca_whirlpools_core::price_to_tick_index;
 use orca_whirlpools::{
-    close_position_instructions, harvest_position_instructions, open_position_instructions,
+    close_position_instructions, harvest_position_instructions, open_position_instructions, 
     set_whirlpools_config_address, HarvestPositionInstruction, IncreaseLiquidityParam,
     WhirlpoolsConfigInput,
 };
@@ -38,7 +38,7 @@ use crate::utils::op;
 
 
 const GAP_SOL:  f64 = 0.002;
-const GAP_B:    f64 = 0.02;
+const GAP_B: f64 = 0.005;
 
 /// Закрывает позицию целиком (сбор комиссий + вывод ликвидности + close).
 pub async fn close_whirlpool_position(
@@ -157,6 +157,8 @@ pub async fn open_with_funds_check_universal(
 ) -> Result<OpenPositionResult> {
     let gap_b = if pool.name == "RAY/SOL" || pool.name == "SOL/USDC" {
         GAP_B
+    } else if pool.name == "WBTC/SOL" {
+        0.000002
     } else {
         0.00002
     };
@@ -242,7 +244,7 @@ pub async fn open_with_funds_check_universal(
             whirl_pk,
             price_low_aligned,
             price_high_aligned,
-            liquidity_param,
+            liquidity_param.clone(),
             Some(slippage_bps),
             Some(wallet_pk),
         )
@@ -377,9 +379,43 @@ pub async fn open_with_funds_check_universal(
     // ───────── 11. Отправляем транзакцию ──────────────────────────────────
     let mut signers: Vec<&Keypair> = vec![&wallet];
     signers.extend(additional_signers.iter());
-    utils::send_and_confirm(rpc, instructions, &signers)
-        .await
-        .map_err(|e| anyhow!("send_and_confirm failed: {}", e))?;
+    let mut instr = instructions;
+    let mut slip = slippage_bps;
+
+    loop {
+        // 11-A: получаем инструкции + новых сигнеров
+        let OpenPositionInstruction {
+            position_mint,
+            instructions,
+            additional_signers,
+            ..
+        } = open_position_instructions(
+                &rpc,
+                whirl_pk,
+                price_low_aligned,
+                price_high_aligned,
+                liquidity_param.clone(),
+                Some(slip),
+                Some(wallet_pk),
+            )
+            .await
+            .map_err(|e| anyhow!("open_position_instructions failed: {e}"))?;
+    
+        // 11-B: формируем fresh-signers для конкретного набора инструкций
+        let mut signers: Vec<&Keypair> = vec![&wallet];
+        signers.extend(additional_signers.iter());
+    
+        // 11-C: пробуем отправить
+        match utils::send_and_confirm(rpc.clone(), instructions, &signers).await {
+            Ok(_) => break, // успех
+            Err(e) if is_token_max(&e) && slip < 1200 => {
+                slip += 300;                    // пробуем ещё раз с большим slippage
+                println!("Retry with slippage = {slip} bps");
+                continue;
+            }
+            Err(e) => return Err(anyhow!("send_and_confirm failed: {e}")),
+        }
+    }
 
     drop(_wallet_guard);
 
@@ -390,24 +426,10 @@ pub async fn open_with_funds_check_universal(
     })
 }
 
+fn is_token_max(e: &anyhow::Error) -> bool {
+    e.to_string().contains("6017") || e.to_string().contains("0x1781")
+}
 
-// pub async fn list_positions_for_owner() -> Result<Vec<PositionOrBundle>> {
-//     // 1) Настраиваем SDK на Mainnet
-//     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-//         .map_err(|e| anyhow!("SDK config failed: {}", e))?;
-
-//     // 2) RPC и адрес владельца
-//     let rpc = utils::init_rpc();
-//     let wallet = utils::load_wallet()?;
-//     let owner = wallet.pubkey();
-
-//     // 3) Фетчим позиции
-//     let positions = fetch_positions_for_owner(&rpc, owner)
-//         .await
-//         .map_err(|e| anyhow!("fetch_positions_for_owner failed: {}", e))?;
-
-//     Ok(positions)
-// }
 pub async fn list_positions_for_owner(
     pool: Option<Pubkey>,
 ) -> Result<Vec<PositionOrBundle>> {
