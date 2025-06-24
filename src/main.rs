@@ -7,22 +7,29 @@ mod exchange;
 mod orchestrator;
 pub mod utils;
 pub mod database;
+pub mod pyth_ws;
 
 use anyhow::Result;
 use dotenv::dotenv;
 use std::sync::Arc;
+use anyhow::anyhow;
 use std::env;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 use std::sync::atomic::Ordering;
+use chrono::Utc;
+
 
 use std::time::Duration;
 use tokio::time::sleep;
 use std::sync::atomic::AtomicBool;
-use params::{TOTAL_USDC_SOLUSDC, PCT_LIST_1, WSOL, USDC};
+use params::{AMOUNT, PCT_LIST_1, PCT_LIST_2, WSOL, USDC, POOL_NUMBER};
 use types::PoolConfig;
 use database::triggers;
 use database::triggers::Trigger;
+use database::positions;
+use database::history;
+use database::general_settings;
 
 use crate::{telegram_service::tl_engine::ServiceCommand};
 
@@ -32,33 +39,53 @@ async fn main() -> Result<()> {
 
 
     triggers::init().await?;
+    positions::init_positions_module().await?;
+    history::init_history_module().await?;
+    general_settings::init_general_settings_module().await?;
+    general_settings::init_settings_from_params().await?;
 
     let close_notify = Arc::new(tokio::sync::Notify::new());
 
     // ─── Telegram
     let (tx_tg, _commander) = telegram_service::tl_engine::start(close_notify.clone());
 
-    let need_to_open_new_positions_SOLUSDC = Arc::new(AtomicBool::new(true)); //true - будут открываться новые при запуске; false - не будут
+    let need_to_open_new_positions_SOLUSDC = Arc::new(AtomicBool::new(false)); //true - будут открываться новые при запуске; false - не будут
+
+    let flag = need_to_open_new_positions_SOLUSDC.load(Ordering::SeqCst);
+    let tr = Trigger {
+        name:     "position_start_open".into(),
+        state:    !flag,
+        position: String::new(),
+    };
+    triggers::upsert_trigger(&tr).await?;
 
     let new_positions = Arc::new(AtomicBool::new(true));
     // ─── A)  SOL/USDC пул  – 3 диапазона
     let solusdc_cfg = PoolConfig {
-        program: "whirlpool",
-        name:    "SOL/USDC",
-        pool_address: Box::leak(env::var("SOLUSDC_POOL")?.into_boxed_str()),
-        mint_a:  WSOL,  decimal_a: 9,
-        mint_b:  USDC,   decimal_b: 6,
-        amount:  0.0,   sol_init: 0.0,
+        program: "whirlpool".to_string(),
+        name:    "SOL/USDC".to_string(),
+        pool_address: env::var("SOLUSDC_POOL")?,
+        mint_a:  WSOL.to_string(),  decimal_a: 9,
+        mint_b:  USDC.to_string(),   decimal_b: 6,
+        amount:  0.0,
         position_1: None, position_2: None, position_3: None,
+
+        date_opened:           Utc::now(),     // или любая другая заглушечная дата
+        is_closed:             false,          // позиция ещё не закрыта
+        commission_collected_1: 0.0,            // пока комиссий нет
+        commission_collected_2: 0.0,
+        commission_collected_3: 0.0,
+        total_value_open:      0.0,            // либо исходная TVL
+        total_value_current:   0.0,            // либо текущее TVL
     };
 
-    let report_cfgs = vec![ solusdc_cfg.clone()];
+    let report_cfgs = vec![solusdc_cfg.clone()];
 
     tokio::spawn(run_pool_with_restart(
-        solusdc_cfg.clone(), TOTAL_USDC_SOLUSDC, PCT_LIST_1, true, 
-        tx_tg.clone(), need_to_open_new_positions_SOLUSDC.clone(), close_notify.clone(), 20, Some(0.03), new_positions.clone()
+        solusdc_cfg.clone(), AMOUNT, PCT_LIST_1, true, 
+        tx_tg.clone(), need_to_open_new_positions_SOLUSDC.clone(), close_notify.clone(), 5, Some(0.03), new_positions.clone()
     ));
-    sleep(Duration::from_secs(20)).await;
+    sleep(Duration::from_secs(50)).await;
 
     // ─── C)  единый репортёр каждые 5 минут ────────────────────────────
     let tx_tel = tx_tg.clone();
@@ -74,13 +101,31 @@ async fn main() -> Result<()> {
             let mut last_profits = VecDeque::<f64>::with_capacity(12); // 12×5 мин = час
             let mut first_loop = true;
             let mut counter = 0;
+
+            loop {
+                match triggers::get_trigger("position_start_open").await {
+                    Ok(Some(tr)) if tr.state => break, // выходим, если триггер включён
+                    Ok(_) => {
+                        // либо нет записи, либо state=false
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        // не удалось прочитать из БД — логируем, ждём и пробуем снова
+                        log::error!("Error reading trigger: {}", e);
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
     
             loop {
                 itv.tick().await;
                 counter+=1;
+
                 // 1) собираем отчёты
                 let mut grand_total = 0.0;
                 let mut msg = String::new();
+
+                let is_new_positions = new_positions.load(Ordering::SeqCst);
     
                 for cfg in &report_cfgs {
                     match orchestrator::build_pool_report(cfg).await {
@@ -96,7 +141,7 @@ async fn main() -> Result<()> {
                 // 2) считаем profit и поддерживаем «кольцевой буфер»
                 let mut profit = 0.0;
 
-                let is_new_positions = new_positions.load(Ordering::SeqCst);
+                
                 if is_new_positions {
                     first_loop = true;
                     last_profits.clear();
@@ -105,7 +150,7 @@ async fn main() -> Result<()> {
                 new_positions.store(false, Ordering::SeqCst);
 
                 if first_loop {
-                    counter = 1;
+                    counter = 0;
                     prev_total = grand_total;
                     first_loop = false;
                 } else {
@@ -185,7 +230,7 @@ async fn run_pool_with_restart(
                     break;                    // больше **не** рестартим
                 }
                 if txt.contains("dns error") || txt.contains("timed out") {
-                    let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+                    let _ = tx_tg.send(ServiceCommand::SendSignal(format!(
                         "🌐 {}: RPC недоступен. Повтор через 15 с…", cfg.name
                     )));
                     sleep(Duration::from_secs(15)).await;
@@ -193,7 +238,7 @@ async fn run_pool_with_restart(
                 }
 
                 // любая другая ошибка → сообщаем и пробуем снова
-                let _ = tx_tg.send(ServiceCommand::SendMessage(format!(
+                let _ = tx_tg.send(ServiceCommand::SendSignal(format!(
                     "⚠️ {} упал: {txt}\nПерезапуск через 15 с…",
                     cfg.name
                 )));

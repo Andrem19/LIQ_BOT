@@ -17,28 +17,11 @@ pub const WBTC: &str = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"; //8
 
 pub const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 pub const KEYPAIR_FILENAME: &str = "/home/jupiter/.config/solana/mainnet-id.json";
-pub const OVR: f64 = 1.01;           // 0.3 % запас
+pub const OVR: f64 = 1.03;
 pub const PCT_LIST_1: [f64; 4] = [0.005, 0.002, 0.004, 0.014];
+pub const PCT_LIST_2: [f64; 4] = [0.003, 0.002, 0.004, 0.01];
 pub const WEIGHTS: [f64; 3] = [10.0, 25.0, 65.0];
-pub const TOTAL_USDC_SOLUSDC: f64 = 1500.0;
-pub const TOTAL_USDC_SOLUSDT: f64 = 100.0;
-pub const USDC_SOLRAY: f64 = 60.0;
-pub const USDC_SOLWETH: f64 = 300.0;
-pub const USDC_SOLWBTC: f64 = 1000.0;
+pub const AMOUNT: f64 = 250.0;
+pub const POOL_NUMBER: u16 = 2;
 
-
-pub const POOL: PoolConfig = PoolConfig {
-    amount: 200.0,
-    program: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-    name: "WSOL/USDC",
-    pool_address: "",
-    position_1: None,
-    position_2: None,
-    position_3: None,
-    mint_a: "So11111111111111111111111111111111111111112",
-    mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    decimal_a: 9,
-    decimal_b: 6,
-    sol_init: 0.0
-};
 

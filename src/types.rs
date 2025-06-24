@@ -1,5 +1,5 @@
 use solana_sdk::pubkey::Pubkey;
-
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Снимок состояния пула, который читает `reporter()`
@@ -35,36 +35,92 @@ pub struct PoolPositionInfo {
     pub pct_up: f64,
 }
 
+// #[derive(Clone, Debug)]
+// pub enum Role {
+//     Middle,
+//     Up,
+//     Down
+// }
+
+// #[derive(Clone, Debug)]
+// pub struct LiqPosition {
+//     pub role: Role,
+//     pub position_address: Option<&'static str>,
+//     pub position_nft: Option<&'static str>,
+//     pub upper_price: f64,
+//     pub lower_price: f64
+// }
+
+// #[derive(Clone, Debug)]
+// pub struct PoolConfig {
+//     pub amount: f64,
+//     pub program:               &'static str,
+//     pub name:                  &'static str,
+//     pub pool_address:          &'static str,
+//     pub position_1:      Option<LiqPosition>,
+//     pub position_2:      Option<LiqPosition>,
+//     pub position_3:      Option<LiqPosition>,
+//     pub mint_a:                &'static str,
+//     pub mint_b:                &'static str,
+//     pub decimal_a:             u16,
+//     pub decimal_b:             u16,
+// }
 #[derive(Clone, Debug)]
 pub enum Role {
     Middle,
     Up,
-    Down
+    Down,
 }
 
+impl Role {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Role::Middle => "Middle",
+            Role::Up     => "Up",
+            Role::Down   => "Down",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Middle" => Some(Role::Middle),
+            "Up"     => Some(Role::Up),
+            "Down"   => Some(Role::Down),
+            _        => None,
+        }
+    }
+}
+
+/// Описание одной ликв. позиции
 #[derive(Clone, Debug)]
 pub struct LiqPosition {
-    pub role: Role,
-    pub position_address: Option<&'static str>,
-    pub position_nft: Option<&'static str>,
-    pub upper_price: f64,
-    pub lower_price: f64
+    pub role:             Role,
+    pub position_address: Option<String>,
+    pub position_nft:     Option<String>,
+    pub upper_price:      f64,
+    pub lower_price:      f64,
 }
 
+/// Полная запись пула (единственная строка, id=1)
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
-    pub amount: f64,
-    pub program:               &'static str,
-    pub name:                  &'static str,
-    pub pool_address:          &'static str,
-    pub position_1:      Option<LiqPosition>,
-    pub position_2:      Option<LiqPosition>,
-    pub position_3:      Option<LiqPosition>,
-    pub mint_a:                &'static str,
-    pub mint_b:                &'static str,
+    pub amount:                f64,
+    pub program:               String,
+    pub name:                  String,
+    pub pool_address:          String,
+    pub position_1:            Option<LiqPosition>,
+    pub position_2:            Option<LiqPosition>,
+    pub position_3:            Option<LiqPosition>,
+    pub mint_a:                String,
+    pub mint_b:                String,
     pub decimal_a:             u16,
     pub decimal_b:             u16,
-    pub sol_init: f64
+    pub date_opened:           DateTime<Utc>,
+    pub is_closed:             bool,
+    pub commission_collected_1:f64,
+    pub commission_collected_2:f64,
+    pub commission_collected_3:f64,
+    pub total_value_open:      f64,
+    pub total_value_current:   f64,
 }
 
 

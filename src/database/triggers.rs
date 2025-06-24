@@ -112,13 +112,34 @@ pub async fn update_trigger(tr: &Trigger) -> Result<Option<Trigger>> {
 pub async fn auto_trade_switch(switch: bool, tx: &UnboundedSender<ServiceCommand>) -> Result<()>  {
     let mut t = Trigger {
         name: "auto_trade".into(),
-        state: true,
+        state: switch,
         position: "opening".into(),
     };
     match upsert_trigger(&t).await {
         Ok(_) => {
             let _ = tx.send(ServiceCommand::SendMessage(
                 "✅ Trigger `auto_trade` enabled".into(),
+            ));
+        }
+        Err(e) => {
+            let _ = tx.send(ServiceCommand::SendMessage(
+                format!("❌ Failed to enable trigger: {}", e),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn open_position_switch(switch: bool, tx: &UnboundedSender<ServiceCommand>) -> Result<()>  {
+    let mut t = Trigger {
+        name: "position_start_open".into(),
+        state: switch,
+        position: "".into(),
+    };
+    match upsert_trigger(&t).await {
+        Ok(_) => {
+            let _ = tx.send(ServiceCommand::SendMessage(
+                "✅ Trigger `position_start_open` enabled".into(),
             ));
         }
         Err(e) => {

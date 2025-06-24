@@ -74,14 +74,14 @@ pub mod utils {
             .await
             .map_err(op("send transaction"))?;
         // 5. Confirm
-        for _ in 0..40 {
+        for _ in 0..18 {
             if let Some(status) = rpc.get_signature_status(&sig).await.map_err(op("get_signature_status"))? {
                 status.map_err(|e| anyhow!("transaction failed: {:?}", e))?;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        Err(anyhow!("Timeout: tx {} not confirmed within 40s", sig))
+        Err(anyhow!("Timeout: tx {} not confirmed within 18s", sig))
     }
 }
 

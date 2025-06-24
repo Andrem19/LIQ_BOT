@@ -103,7 +103,7 @@ static PRICE_CACHE: Lazy<tokio::sync::RwLock<(f64, Instant)>> =
 /// Возвращает актуальную цену 1 SOL в USD (сначала Jupiter, резерв — CoinGecko)
 ///
 /// *Цена кэшируется на 30 секунд.*
-pub async fn get_sol_price_usd() -> Result<f64> {
+pub async fn get_sol_price_usd(mint: &str, fallback: bool) -> Result<f64> {
     // -------- 0. быстрый взгляд в кэш -----------------------------------
     {
         let rd = PRICE_CACHE.read().await;
@@ -116,7 +116,7 @@ pub async fn get_sol_price_usd() -> Result<f64> {
 
     // -------- 1. пробуем Jupiter lite-api --------------------------------
     let url = format!(
-        "https://lite-api.jup.ag/price/v2?ids={SOL_MINT}"
+        "https://lite-api.jup.ag/price/v2?ids={mint}"
     );
     if let Ok(resp) = client.get(&url).send().await {
         if resp.status().is_success() {
@@ -131,16 +131,17 @@ pub async fn get_sol_price_usd() -> Result<f64> {
             }
         }
     }
-
-    // -------- 2. fallback → CoinGecko ------------------------------------
-    let cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
-    let resp = client.get(cg_url).send().await?;
-    let body = resp.text().await?;
-    let v: Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("CoinGecko JSON parse error: {e}  body={body}"))?;
-    if let Some(price) = v["solana"]["usd"].as_f64() {
-        cache_price(price).await;
-        return Ok(price);
+    if fallback {
+        // -------- 2. fallback → CoinGecko ------------------------------------
+        let cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+        let resp = client.get(cg_url).send().await?;
+        let body = resp.text().await?;
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("CoinGecko JSON parse error: {e}  body={body}"))?;
+        if let Some(price) = v["solana"]["usd"].as_f64() {
+            cache_price(price).await;
+            return Ok(price);
+        }
     }
 
     Err(anyhow!("cannot fetch SOL/USD price from Jupiter or CoinGecko"))

@@ -6,14 +6,14 @@ use ta::indicators::AverageTrueRange;
 use ta::{DataItem, Next};
 
 /// Представление одной 5-минутной свечи
-#[derive(Debug)]
-struct Candle {
-    timestamp: i64,
-    open:      f64,
-    high:      f64,
-    low:       f64,
-    close:     f64,
-    volume:    f64,
+#[derive(Debug, Clone, Copy)]
+pub struct Candle {
+    pub timestamp: i64,
+    pub open:      f64,
+    pub high:      f64,
+    pub low:       f64,
+    pub close:     f64,
+    pub volume:    f64,
 }
 
 /// Запрос последних `limit` баров для символа `symbol` с интервалом `interval` минут.
@@ -56,6 +56,13 @@ pub async fn get_kline(
         candles.push(Candle { timestamp: ts, open, high, low, close, volume });
     }
     Ok(candles)
+}
+
+pub fn percentage_change(base: f64, other: f64) -> f64 {
+    if base == 0.0 {
+        panic!("Невозможно вычислить изменение: базовое значение (base) равно нулю");
+    }
+    (other - base) / base
 }
 
 /// Агрегирует массивы OHLCV в более крупный таймфрейм.
@@ -103,44 +110,40 @@ pub fn convert_timeframe(
 /// - `five_min_limit` — сколько 5-минутных баров скачать (мы возьмём 400 по умолчанию)  
 /// - `timeframe` — сколько 5-минуток в одном баре (12 = 1h)  
 /// - `atr_period` — период ATR (14 по умолчанию)
-pub async fn get_atr_1h(
-    symbol: &str,
-    five_min_limit: usize,
-    timeframe: usize,
+pub fn get_atr(
+    o1h: &Vec<f64>,
+    h1h: &Vec<f64>,
+    l1h: &Vec<f64>,
+    c1h: &Vec<f64>,
+    v1h: &Vec<f64>,
     atr_period: usize,
 ) -> Result<Vec<f64>> {
-    // 1) Скачиваем 5m-свечи
-    let candles_5m = get_kline(symbol, five_min_limit, 5).await?;
-    if candles_5m.is_empty() {
-        return Err(anyhow::anyhow!("Не удалось получить 5m свечи"));
+    let len = o1h.len();
+    if len == 0
+        || h1h.len() != len
+        || l1h.len() != len
+        || c1h.len() != len
+        || v1h.len() != len
+    {
+        return Err(anyhow::anyhow!(
+            "Входные векторы должны быть непустыми и одинаковой длины"
+        ));
     }
 
-    // 2) Разделяем на отдельные векторы
-    let opens:   Vec<f64> = candles_5m.iter().map(|c| c.open).collect();
-    let highs:   Vec<f64> = candles_5m.iter().map(|c| c.high).collect();
-    let lows:    Vec<f64> = candles_5m.iter().map(|c| c.low).collect();
-    let closes:  Vec<f64> = candles_5m.iter().map(|c| c.close).collect();
-    let volumes: Vec<f64> = candles_5m.iter().map(|c| c.volume).collect();
-
-    // 3) Конвертируем в hourly
-    let (o1h, h1h, l1h, c1h, v1h) =
-        convert_timeframe(&opens, &highs, &lows, &closes, &volumes, timeframe, 0);
-
-    // 4) Считаем ATR по часовым барам
     let mut atr = AverageTrueRange::new(atr_period)
-        .expect("period ATR must be > 0");
-    let mut result = Vec::with_capacity(o1h.len());
-    for i in 0..o1h.len() {
+        .expect("Период ATR должен быть больше 0");
+
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
         let di = DataItem::builder()
+            .open(o1h[i])
             .high(h1h[i])
             .low(l1h[i])
             .close(c1h[i])
-            .open(o1h[i])
             .volume(v1h[i])
             .build()
             .unwrap();
-        let v = atr.next(&di);
-        result.push(v);
+        result.push(atr.next(&di));
     }
 
     Ok(result)
