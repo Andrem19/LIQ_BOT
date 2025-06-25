@@ -11,8 +11,11 @@ use orca_tx_sender::Signer;
 use solana_client::{
     rpc_client::RpcClient,
 };
+
+use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+use solana_sdk::transaction::Transaction;
+use std::env;
 use crate::utils;
-use crate::orca_logic::helpers;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{read_keypair_file, Keypair},
@@ -49,14 +52,22 @@ pub async fn execute_swap_tokens(
 
     // ─── 1. amount_in → atoms ───────────────────────────────────────────
     let amount_atoms = ((amount_in * 10f64.powi(in_dec as i32)).ceil()) as u64;
-
+    
 
     // ─── 2. сеть / кошелёк ──────────────────────────────────────────────
     let payer : Keypair      = read_keypair_file(KEYPAIR_FILENAME)
     .map_err(|e| anyhow!("read_keypair_file failed: {}", e))?;
     let wallet: Pubkey       = payer.pubkey();
-    let rpc    = RpcClient::new(RPC_URL.to_string());
+
+    let rpc_url = env::var("HELIUS_HTTP")?;
+
+    let rpc    = RpcClient::new(rpc_url.to_string());
     let http   = http_client();
+
+
+    let wsol_pubkey = Pubkey::from_str(&WSOL)?;
+    ensure_ata_sync(&rpc, &payer, &wallet, &wsol_pubkey)?;
+
 
     let get_bal = |mint: &Pubkey, dec: u8| -> Result<f64> {
         if mint.to_string() == WSOL {
@@ -134,7 +145,7 @@ pub async fn execute_swap_tokens(
                 continue;       // получаем новый quote и пытаемся снова
             }
             Err(e) if LIQ_ERRORS.iter().any(|tag| e.to_string().contains(tag)) => {
-                let price_usdc = helpers::get_sol_price_usd(sell_mint, false).await?;
+                let price_usdc = utils::get_sol_price_usd(sell_mint, false).await?;
                 let usd_total  = amount_in * price_usdc;
                 let parts = match usd_total {
                     x if x <  50.0   => 1,
@@ -238,4 +249,33 @@ fn mint_pub_dec(symbol: &str) -> Result<(Pubkey,u8)> {
         USDT => (Pubkey::from_str(USDT)?, 6),
         _    => bail!("mint {symbol} не поддерживается"),
     })
+}
+
+fn ensure_ata_sync(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    owner: &Pubkey,
+    mint: &Pubkey,
+) -> anyhow::Result<()> {
+    let ata = get_associated_token_address(owner, mint);
+    if rpc.get_account(&ata).is_err() {
+        // создаём idempotent-версию ATA — безопасно, если уже существует
+        let ix = create_associated_token_account_idempotent(
+            &payer.pubkey(), // funding_address (payer)
+            owner,           // wallet_address (owner)
+            mint,            // mint
+            &spl_token::id(),// **программа ассоц. токен аккаунта**
+        );
+        let recent = rpc.get_latest_blockhash()
+            .map_err(|e| anyhow::anyhow!("get_latest_blockhash failed: {}", e))?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            recent,
+        );
+        rpc.send_and_confirm_transaction(&tx)
+            .map_err(|e| anyhow::anyhow!("create ATA failed: {}", e))?;
+    }
+    Ok(())
 }

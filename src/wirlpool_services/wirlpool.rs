@@ -1,32 +1,27 @@
 use anyhow::{anyhow, Result};
-use ethers::contract::EthDisplay;
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
 };
-use spl_token::id as spl_token_program_id;
-use orca_whirlpools::NativeMintWrappingStrategy;
-use orca_whirlpools::set_native_mint_wrapping_strategy;
+use spl_associated_token_account;
+use spl_token;
 use orca_whirlpools_client::ID;
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use solana_sdk::pubkey::Pubkey;
 use anyhow::Context;
-use solana_sdk::instruction::Instruction;
 use tokio::time::sleep;
 use spl_associated_token_account::get_associated_token_address;
 use solana_sdk::{
     signature::{Keypair, Signer},
 };
 use crate::database::history;
+use crate::database::triggers;
 use orca_whirlpools::increase_liquidity_instructions;
 use orca_whirlpools_core::sqrt_price_to_tick_index;
-use orca_whirlpools::DecreaseLiquidityInstruction;
 use spl_associated_token_account::instruction::create_associated_token_account;
-use orca_whirlpools::DecreaseLiquidityParam;
 use orca_whirlpools_client::Position;
 use anyhow::bail;
-use crate::{orca_logic::helpers::get_sol_price_usd, params::WSOL};
+use crate::{utils::get_sol_price_usd, params::WSOL};
 use orca_whirlpools::{
     fetch_positions_for_owner,
     PositionOrBundle,
@@ -50,6 +45,7 @@ use orca_whirlpools_core::{CollectFeesQuote, U128, sqrt_price_to_price};
 use crate::wirlpool_services::swap::execute_swap_tokens;
 use crate::types::{PoolConfig, OpenPositionResult};
 use crate::utils::op;
+use crate::utils::fetch_wallet_balance_info;
 
 
 const GAP_SOL:  f64 = 0.002;
@@ -231,8 +227,8 @@ pub async fn open_with_funds_check_universal(
             let ix = create_associated_token_account(
                 &wallet_pk,             // funding_address
                 &wallet_pk,             // wallet_address
-                &native_mint,           // token_mint_address
-                &spl_token_program_id(),// token_program_id ← **ИЗМЕНЕНО**
+                &native_mint,           
+                &spl_token::id(),
             );
             utils::send_and_confirm(rpc.clone(), vec![ix], &[&wallet]).await?;
         }
@@ -458,6 +454,8 @@ pub async fn list_positions_for_owner(
 
 
 pub async fn close_all_positions(slippage: u16, pool: Option<Pubkey>) -> Result<()> {
+
+    triggers::closing_switcher(true, None).await?;
     // 1) Список всех позиций
     let positions = list_positions_for_owner(pool)
         .await
@@ -483,6 +481,7 @@ pub async fn close_all_positions(slippage: u16, pool: Option<Pubkey>) -> Result<
 
             // ИЗМЕНЕНО: не возвращаем Err, а запоминаем неудачи
             if let Err(err) = close_whirlpool_position(mint, slippage).await {
+                triggers::closing_switcher(false, None).await?;
                 log::error!("❌ First-pass failed mint={} err={:?}", mint, err);  // ИЗМЕНЕНО
                 failed_mints.push(mint);                                         // ИЗМЕНЕНО
             } else {
@@ -502,6 +501,8 @@ pub async fn close_all_positions(slippage: u16, pool: Option<Pubkey>) -> Result<
             }
         }
     }
+
+
 
     // Если все закрылись с первого раза — выходим
     if failed_mints.is_empty() {
@@ -558,7 +559,8 @@ pub async fn close_all_positions(slippage: u16, pool: Option<Pubkey>) -> Result<
     log::debug!("🎉 Done attempts to close all positions (with retry).");
     history::record_session_history().await?;
     positions::delete_pool_config().await?;
-    
+    triggers::closing_switcher(false, None).await?;
+
     Ok(())
 }
 
@@ -800,35 +802,59 @@ pub async fn decrease_liquidity_partial(
 
 
 
-/// Добавить ликвидность на `add_b` токена-B (USDC / RAY / wETH / …) к позиции.
-/// При необходимости докупаем недостающие токены (SOL / B) через rebalance.
+/// Добавляет ликвидность в существующую позицию, оперируя **только** целевым
+/// бюджетом в USDC.  Функция сама вычисляет, сколько SOL (Token A) и USDC
+/// (Token B) нужно внести — в зависимости от того, находится ли цена пары
+/// выше, ниже или внутри ценового диапазона позиции.
+///
+/// * **usd_budget** — сколько долларов пользователь хочет завести в позицию;  
+/// * если позиция выше рынка — весь бюджет конвертируется в SOL;  
+/// * если позиция ниже рынка — весь бюджет остаётся USDC;  
+/// * если цена попадает внутрь диапазона — бюджет делится между SOL и USDC
+///   пропорционально теоретической формуле Uniswap v3:
+///   ```text
+///   ΔA = L · (√P − √P_L) / (√P · √P_L)
+///   ΔB = L · (√P_U − √P)
+///   ```
+///   где  L  выбирается так, чтобы общая стоимость (в USDC) равнялась
+///   `usd_budget`.
+#[allow(clippy::too_many_lines)]
 pub async fn increase_liquidity_partial(
     position_mint: Pubkey,
-    mut add_a: f64,        // свободный SOL
-    mut add_b: f64,        // свободный USDC
-    pool:      &PoolConfig,
-    base_slip: u16,
+    usd_budget:    f64,           // ← сумма, которой распоряжаемся (в USDC)
+    pool:          &PoolConfig,
+    base_slip:     u16,
 ) -> anyhow::Result<()> {
-    // ── 1. SDK / RPC / wallet --------------------------------------------
+    // ─────────────────────────────────────────────────────────────────────
+    const BUFFER: f64       = 1.12;   // 12 % запас на ценовые колебания
+    const OVR:    f64       = 1.015;  // +1.5 % к объёму свапов
+    const WSOL_MINT: &str   = WSOL;   // из params
+    const SOL_RESERVE: f64  = 0.07;   // минимум SOL, который нельзя трогать
+    // ─────────────────────────────────────────────────────────────────────
+
+    // 1. Инициализация SDK / RPC / кошелька ──────────────────────────────
     set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaMainnet)
-    .map_err(|e| anyhow!("SDK config failed: {}", e))?;
-    let rpc    = utils::init_rpc();
-    let wallet = utils::load_wallet()?;
-    let owner  = wallet.pubkey();
+        .map_err(|e| anyhow!("SDK config failed: {e}"))?;
 
-    let dec_a = pool.decimal_a as u8;
-    let dec_b = pool.decimal_b as u8;
+    let native_mint = Pubkey::from_str(WSOL_MINT)?;
+    let rpc         = utils::init_rpc();
+    let wallet      = utils::load_wallet()?;
+    let wallet_pk   = wallet.pubkey();
+    let owner       = wallet.pubkey();
 
-    // ── 2. Читаем позицию и пул ------------------------------------------
+    let dec_a = pool.decimal_a as u8;     // 9 для SOL
+    let dec_b = pool.decimal_b as u8;     // 6 для USDC
+
+    // 2. Читаем позицию и пул ────────────────────────────────────────────
     let (pos_addr, _) = Pubkey::find_program_address(&[b"position", position_mint.as_ref()], &ID);
     let pos_acc   = rpc.get_account(&pos_addr).await?;
     let pos       = Position::from_bytes(&pos_acc.data)?;
     let whirl_acc = rpc.get_account(&pos.whirlpool).await?;
     let whirl     = Whirlpool::from_bytes(&whirl_acc.data)?;
 
-    // ── 3. Определяем режим целевой позиции ------------------------------
-    let tick_c = sqrt_price_to_tick_index(U128::from(whirl.sqrt_price));
-    let price_c = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b);
+    // 3. Текущее состояние цен и режим позиции ───────────────────────────
+    let tick_c  = sqrt_price_to_tick_index(U128::from(whirl.sqrt_price));
+    let price_c = sqrt_price_to_price(U128::from(whirl.sqrt_price), dec_a, dec_b); // USDC за 1 SOL
     let price_l = tick_index_to_price(pos.tick_lower_index, dec_a, dec_b);
     let price_u = tick_index_to_price(pos.tick_upper_index, dec_a, dec_b);
 
@@ -840,54 +866,269 @@ pub async fn increase_liquidity_partial(
         price_l,
         price_u,
     );
-    println!("→ целевая позиция: {:?}", mode);
+    println!("→ целевая позиция: {:?}, spot = {:.4}", mode, price_c);
 
-    // ── 4. При необходимости конвертируем токены -------------------------
-    match mode {
-        Mode::OnlyA => {
-            if add_b > 1e-9 {
-                execute_swap_tokens(USDC, WSOL, add_b * OVR).await?;
-                add_a += add_b / price_c;
-                add_b  = 0.0;
+    // 4. Рассчитываем требуемые ΔA и ΔB (+12 % буфер) ────────────────────
+    let (mut add_a, mut add_b) = match mode {
+        Mode::OnlyA => ((usd_budget / price_c) * BUFFER, 0.0),
+
+        Mode::OnlyB => (0.0, usd_budget * BUFFER),
+
+        Mode::Mixed => {
+            // формулы Uniswap v3
+            let (sqrt_pl, sqrt_pu, sqrt_p) = (price_l.sqrt(), price_u.sqrt(), price_c.sqrt());
+
+            let per_l_usd =
+                  ((sqrt_p - sqrt_pl) / (sqrt_p * sqrt_pl) * price_c)
+                +  (sqrt_pu - sqrt_p);
+
+            if per_l_usd <= 0.0 {
+                return Err(anyhow!("Некорректный per_liquidity_usd = {per_l_usd}"));
             }
+            let liquidity = usd_budget / per_l_usd;
+
+            let delta_sol  = liquidity * (sqrt_pu - sqrt_p) / (sqrt_pu * sqrt_p); // SOL-часть
+            let delta_usdc = liquidity * (sqrt_p  - sqrt_pl);                     // USDC-часть
+            (delta_sol * BUFFER, delta_usdc * BUFFER)
         }
-        Mode::OnlyB => {
-            if add_a > 1e-9 {
-                execute_swap_tokens(WSOL, USDC, add_a * OVR).await?;
-                add_b += add_a * price_c;
-                add_a  = 0.0;
-            }
-        }
-        Mode::Mixed => {} // ничего не меняем
+    };
+
+    println!(
+        "⮑ расчёт: add_a = {:.6} SOL, add_b = {:.2} USDC (budget = {:.2} USD)",
+        add_a, add_b, usd_budget
+    );
+
+    // 5. Гарантируем, что ATA для wSOL существует ────────────────────────
+    let ata_a = get_associated_token_address(&wallet_pk, &native_mint);
+    if rpc.get_account(&ata_a).await.is_err() {
+        let ix = create_associated_token_account(
+            &wallet_pk, &wallet_pk, &native_mint, &spl_token::id(),
+        );
+        utils::send_and_confirm(rpc.clone(), vec![ix], &[&wallet]).await?;
     }
 
-    // ── 5. Строим IncreaseLiquidityParam ---------------------------------
-    let param = match mode {
+    // 6. Балансировка кошелька под рассчитанные add_a / add_b ────────────
+    match mode {
+        // ─── позиция «только SOL» ───────────────────────────────────────
+        Mode::OnlyA => {
+            if add_a > 1e-9 {
+                execute_swap_tokens(USDC, WSOL, usd_budget * OVR).await?;
+            }
+            add_b = 0.0;
+        }
+
+        // ─── позиция «только USDC» – новая логика с резервом SOL ────────
+        Mode::OnlyB => {
+            // текущее содержимое «кошелька SOL»
+            let wallet_sol  = rpc.get_balance(&wallet_pk).await? as f64 / 1e9;
+            let wsol_on_ata = rpc
+                .get_token_account_balance(&ata_a).await.ok()
+                .and_then(|ui| ui.amount.parse::<u64>().ok())
+                .map(|v| v as f64 / 1e9)
+                .unwrap_or(0.0);                                     // ★ NEW
+            let have_sol_tot = wallet_sol + wsol_on_ata;             // ★ NEW
+        
+            // текущее содержимое «кошелька USDC»
+            let ata_b   = get_associated_token_address(
+                            &wallet_pk, &Pubkey::from_str(USDC)?);
+            let have_usdc = rpc.get_token_account_balance(&ata_b).await.ok()
+                .and_then(|ui| ui.amount.parse::<u64>().ok())
+                .map(|v| v as f64 / 10f64.powi(dec_b as i32))
+                .unwrap_or(0.0);
+        
+            // сколько USDC ещё нужно?
+            let need_usdc = (add_b - have_usdc).max(0.0);
+            if need_usdc > 1e-6 {
+                let sol_to_swap = need_usdc / price_c * OVR;
+        
+                // сначала пробуем продать то, что уже лежит в WSOL
+                let sell_from_wsol = sol_to_swap.min(wsol_on_ata);   // ★ NEW
+                if sell_from_wsol > 1e-9 {
+                    execute_swap_tokens(WSOL, USDC, sell_from_wsol).await?;
+                }
+        
+                // если ещё не хватило — докидываем лампорты из кошелька
+                let remaining = sol_to_swap - sell_from_wsol;        // ★ NEW
+                if remaining > 1e-9 {
+                    let free_lamports = wallet_sol - SOL_RESERVE;
+                    if remaining > free_lamports + 1e-9 {
+                        bail!("Недостаточно свободного SOL для обмена (нужно {:.3}, есть {:.3})",
+                              remaining, free_lamports);
+                    }
+                    execute_swap_tokens(WSOL, USDC, remaining).await?;
+                }
+            }
+        
+            add_a = 0.0;           // в позицию всё равно не кладём SOL
+        }
+
+        // ─── позиция «смешанная» – прежняя логика ────────────────────────
+        Mode::Mixed => {
+            // проверяем текущие кошельковые запасы
+            let have_a = rpc.get_balance(&wallet_pk).await? as f64 / 1e9;
+            let ata_b  = get_associated_token_address(&wallet_pk, &Pubkey::from_str(USDC)?);
+            let have_b_atoms = rpc
+                .get_token_account_balance(&ata_b)
+                .await
+                .ok()
+                .and_then(|ui| ui.amount.parse::<u64>().ok())
+                .unwrap_or(0);
+            let have_b = have_b_atoms as f64 / 10f64.powi(dec_b as i32);
+
+            if add_a > have_a + 1e-9 {
+                let need_sol = add_a - have_a;
+                execute_swap_tokens(USDC, WSOL, need_sol * price_c * OVR).await?;
+            }
+            if add_b > have_b + 1e-6 {
+                let need_usdc = add_b - have_b;
+                execute_swap_tokens(WSOL, USDC, need_usdc / price_c * OVR).await?;
+            }
+        }
+    }
+
+    let ata_a = get_associated_token_address(&wallet_pk, &native_mint);
+    if rpc.get_account(&ata_a).await.is_err() {
+        let ix = create_associated_token_account(
+            &wallet_pk, &wallet_pk, &native_mint, &spl_token::id(),
+        );
+        utils::send_and_confirm(rpc.clone(), vec![ix], &[&wallet]).await?;
+    }
+
+    // ─── 7. Формируем IncreaseLiquidityParam ────────────────────────────────
+    let (param, final_quote) = match mode {
+        // ─────────────────────────────────────────────────────────
         Mode::OnlyA => {
             let lamports = (add_a * 10f64.powi(dec_a as i32)).ceil() as u64;
-            IncreaseLiquidityParam::TokenA(lamports.max(1))
+            let q = increase_liquidity_instructions(
+                &rpc,
+                position_mint,
+                IncreaseLiquidityParam::TokenA(lamports.max(1)),
+                Some(base_slip),
+                Some(owner),
+            ).await
+            .map_err(|e| anyhow!("increase_liquidity_instructions failed: {e}"))?;
+            (IncreaseLiquidityParam::TokenA(lamports.max(1)), q)
         }
+        // ─────────────────────────────────────────────────────────
         Mode::OnlyB => {
-            let atoms = (add_b * 10f64.powi(dec_b as i32)).ceil() as u64;
-            IncreaseLiquidityParam::TokenB(atoms.max(1))
-        }
-        Mode::Mixed => {
-            // для Mixed удобнее считать от USDC: quote вернёт точный liquidity_delta
             let atoms_b = (add_b * 10f64.powi(dec_b as i32)).ceil() as u64;
-            let quote = increase_liquidity_instructions(
+            let q = increase_liquidity_instructions(
                 &rpc,
                 position_mint,
                 IncreaseLiquidityParam::TokenB(atoms_b.max(1)),
                 Some(base_slip),
                 Some(owner),
+            ).await
+            .map_err(|e| anyhow!("increase_liquidity_instructions failed: {e}"))?;
+            (IncreaseLiquidityParam::TokenB(atoms_b.max(1)), q)
+        }
+        // ─────────────────────────────────────────────────────────
+        Mode::Mixed => {
+            // 1) USDC-бюджет сразу переводим в атомы
+            let atoms_b_budget = (add_b * 10f64.powi(dec_b as i32)).ceil() as u64;
+        
+            // 2) Первый (полный) quote по бюджету токена-B
+            let full_quote = increase_liquidity_instructions(
+                &rpc,
+                position_mint,
+                IncreaseLiquidityParam::TokenB(atoms_b_budget.max(1)),
+                Some(base_slip),
+                Some(owner),
             )
             .await
-            .map_err(|e| anyhow!("increase_liquidity_instructions failed: {}", e))?;
-            IncreaseLiquidityParam::Liquidity(quote.quote.liquidity_delta.max(1))
+            .map_err(|e| anyhow!("full quote failed: {e}"))?;
+        
+            // 3) Сколько это $ стоит на самом деле?
+            let want_sol  = full_quote.quote.token_est_a as f64 / 10f64.powi(dec_a as i32);
+            let want_usdc = full_quote.quote.token_est_b as f64 / 10f64.powi(dec_b as i32);
+            let want_usd  = want_usdc + want_sol * price_c;
+        
+            // 4) При необходимости уменьшаем liquidity, чтобы уложиться в BUFFER-бюджет
+            let (final_quote, liquidity_delta) = if want_usd > usd_budget * BUFFER {
+                // нужен «шринк»
+                let ratio = (usd_budget * BUFFER) / want_usd;
+                let liq   = ((full_quote.quote.liquidity_delta as f64) * ratio * 0.995).floor() as u128;
+        
+                let q = increase_liquidity_instructions(
+                    &rpc,
+                    position_mint,
+                    IncreaseLiquidityParam::Liquidity(liq.max(1)),
+                    Some(base_slip),
+                    Some(owner),
+                )
+                .await
+                .map_err(|e| anyhow!("scaled quote failed: {e}"))?;
+        
+                (q, liq)
+            } else {
+                // полный quote целиком укладывается в лимит
+                let liq = full_quote.quote.liquidity_delta;
+                (full_quote, liq)
+            };
+        
+            // 5) Докупаем недостающее *по фактическим* token_max из final_quote
+            let need_sol  = final_quote.quote.token_max_a as f64 / 10f64.powi(dec_a as i32);
+            let need_usdc = final_quote.quote.token_max_b as f64 / 10f64.powi(dec_b as i32);
+        
+            // — текущие остатки —
+            let wallet_sol = rpc.get_balance(&wallet_pk).await? as f64 / 1e9;
+            let wsol_on_ata = rpc.get_token_account_balance(&ata_a).await.ok()
+                             .and_then(|ui| ui.amount.parse::<u64>().ok())
+                             .map(|v| v as f64 / 1e9)
+                             .unwrap_or(0.0);
+            let have_sol_total = wallet_sol + wsol_on_ata;
+        
+            let ata_b = get_associated_token_address(&wallet_pk, &Pubkey::from_str(USDC)?);
+            let have_usdc = rpc.get_token_account_balance(&ata_b).await.ok()
+                .and_then(|ui| ui.amount.parse::<u64>().ok())
+                .map(|v| v as f64 / 10f64.powi(dec_b as i32))
+                .unwrap_or(0.0);
+        
+            if need_sol  > have_sol_total + 1e-9 {
+                execute_swap_tokens(
+                    USDC, WSOL,
+                    (need_sol - have_sol_total) * price_c * OVR
+                ).await?;
+            }
+            if need_usdc > have_usdc + 1e-6 {
+                execute_swap_tokens(
+                    WSOL, USDC,
+                    (need_usdc - have_usdc) / price_c * OVR
+                ).await?;
+            }
+        
+            // 6) Готовые param / quote для продолжения внешней логики
+            (
+                IncreaseLiquidityParam::Liquidity(liquidity_delta.max(1)),
+                final_quote
+            )
         }
     };
 
-    // ── 6. Цикл эскалации slippage ---------------------------------------
+    // ─── 7-bis.  Досвап при нехватке (только после final_quote) ─────────────
+    if let Mode::Mixed = mode {
+        let need_sol  = final_quote.quote.token_max_a as f64 / 10f64.powi(dec_a as i32);
+        let need_usdc = final_quote.quote.token_max_b as f64 / 10f64.powi(dec_b as i32);
+    
+        let have_sol  = rpc.get_balance(&wallet_pk).await? as f64 / 10f64.powi(dec_a as i32);
+        let ata_b     = get_associated_token_address(&wallet_pk, &Pubkey::from_str(USDC)?);
+        let have_usdc = rpc.get_token_account_balance(&ata_b).await.ok()
+            .and_then(|ui| ui.amount.parse::<u64>().ok())
+            .map(|v| v as f64 / 10f64.powi(dec_b as i32))
+            .unwrap_or(0.0);
+    
+        if need_sol  > have_sol  + 1e-9 {
+            execute_swap_tokens(USDC, WSOL,
+                (need_sol  - have_sol ) * price_c * OVR).await?;
+        }
+        if need_usdc > have_usdc + 1e-6 {
+            execute_swap_tokens(WSOL, USDC,
+                (need_usdc - have_usdc) / price_c * OVR).await?;
+        }
+    }
+
+
+    // 8. Пытаемся добавить ликвидность, расширяя слиппедж ────────────────
     const SLIPS: &[u16] = &[150, 500, 1_200];
     for &slip in std::iter::once(&base_slip).chain(SLIPS.iter()) {
         let ix = increase_liquidity_instructions(
@@ -898,30 +1139,32 @@ pub async fn increase_liquidity_partial(
             Some(owner),
         )
         .await
-        .map_err(|e| anyhow!("increase_liquidity_instructions failed: {}", e))?;
-        
+        .map_err(|e| anyhow!("increase_liquidity_instructions failed: {e}"))?;
 
         let mut signers = vec![&wallet];
         signers.extend(ix.additional_signers.iter());
 
         match utils::send_and_confirm(rpc.clone(), ix.instructions, &signers).await {
             Ok(_) => {
-                println!("✓ добавил ликвидность (slip = {slip})");
+                println!("✓ ликвидность добавлена (slip = {slip} bps)");
                 return Ok(());
             }
-            Err(e) if e.to_string().contains("TokenMinSubceeded") => continue,
-            Err(e) => return Err(anyhow::anyhow!(e)),
+            Err(e)
+                if  e.to_string().contains("TokenMinSubceeded")
+                 || e.to_string().contains("TokenMaxExceeded")
+                 || e.to_string().contains("custom program error: 0x1781") =>
+            {
+                // увеличиваем slippage и повторяем
+                continue;
+            }
+            Err(e) => return Err(anyhow!(e)),
         }
     }
-    Err(anyhow::anyhow!("increase_liquidity: все попытки неудачны"))
+
+    Err(anyhow!("increase_liquidity_partial: все попытки неудачны"))
 }
 
-fn derive_position_addr(position_mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"position", position_mint.as_ref()],
-        &ID,        // whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc
-    ).0
-}
+
 
 pub fn position_mode(
     tick_c: i32, tick_l: i32, tick_u: i32,

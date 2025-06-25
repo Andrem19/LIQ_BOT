@@ -47,7 +47,8 @@ pub async fn init_positions_module() -> sqlx::Result<()> {
             date_opened               TEXT NOT NULL,
             is_closed                 INTEGER NOT NULL DEFAULT 0,
             total_value_open          REAL NOT NULL,
-            total_value_current       REAL NOT NULL
+            total_value_current       REAL NOT NULL,
+            wallet_balance            REAL NOT NULL
         );
         "#
     )
@@ -76,6 +77,7 @@ pub async fn upsert_pool_config(
     commission3: f64,
     total_value_open: f64,
     total_value_current: f64,
+    wallet_balance: f64,            // ← новый параметр
 ) -> sqlx::Result<()> {
     sqlx::query(
         r#"
@@ -85,14 +87,14 @@ pub async fn upsert_pool_config(
             position_role_1, position_address_1, position_nft_1, upper_price_1, lower_price_1, commission_collected_1,
             position_role_2, position_address_2, position_nft_2, upper_price_2, lower_price_2, commission_collected_2,
             position_role_3, position_address_3, position_nft_3, upper_price_3, lower_price_3, commission_collected_3,
-            date_opened, is_closed, total_value_open, total_value_current
+            date_opened, is_closed, total_value_open, total_value_current, wallet_balance
         ) VALUES (
             1, ?1, ?2, ?3, ?4,
             ?5, ?6, ?7, ?8,
             ?9, ?10, ?11, ?12, ?13, ?14,
             ?15, ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25, ?26,
-            ?27, ?28, ?29, ?30
+            ?27, ?28, ?29, ?30, ?31
         )
         ON CONFLICT(id) DO UPDATE SET
             amount                   = excluded.amount,
@@ -124,7 +126,8 @@ pub async fn upsert_pool_config(
             date_opened              = excluded.date_opened,
             is_closed                = excluded.is_closed,
             total_value_open         = excluded.total_value_open,
-            total_value_current      = excluded.total_value_current
+            total_value_current      = excluded.total_value_current,
+            wallet_balance           = excluded.wallet_balance
         ;
         "#
     )
@@ -162,12 +165,13 @@ pub async fn upsert_pool_config(
     .bind(if is_closed { 1 } else { 0 })
     .bind(total_value_open)
     .bind(total_value_current)
+    .bind(wallet_balance)             // ← новое биндинг
     .execute(&*DB)
     .await?;
     Ok(())
 }
 
-/// Вернуть запись (id = 1)
+/// Вернуть запись (id = 1), теперь с wallet_balance
 pub async fn get_pool_config() -> sqlx::Result<Option<PoolConfig>> {
     if let Some(row) = sqlx::query("SELECT * FROM pool_configs WHERE id = 1")
         .fetch_optional(&*DB)
@@ -192,7 +196,7 @@ pub async fn get_pool_config() -> sqlx::Result<Option<PoolConfig>> {
             })
         };
 
-        // Парсим дату_opened
+        // Парсим date_opened
         let dt_str: String = row.try_get("date_opened")?;
         let date_opened = DateTime::parse_from_rfc3339(&dt_str)
             .map_err(|e| sqlx::Error::Protocol(format!("Invalid date_opened: {}", e)))?
@@ -217,6 +221,7 @@ pub async fn get_pool_config() -> sqlx::Result<Option<PoolConfig>> {
             commission_collected_3: row.try_get("commission_collected_3")?,
             total_value_open:       row.try_get("total_value_open")?,
             total_value_current:    row.try_get("total_value_current")?,
+            wallet_balance:         row.try_get("wallet_balance")?, // ← новое поле
         };
         Ok(Some(cfg))
     } else {
@@ -230,6 +235,7 @@ pub async fn record_position_metrics(
     commission2: f64,
     commission3: f64,
     total_value_current: f64,
+    wallet_balance: f64
 ) -> sqlx::Result<()> {
     let now = Utc::now();
 
@@ -241,7 +247,7 @@ pub async fn record_position_metrics(
         .as_ref()
         .map(|r| r.is_closed)
         .unwrap_or(true);
-
+    println!("is_first_run: {}", &is_first_run);
     if is_first_run {
         // ─── ПЕРВЫЙ запуск ─────────────────────────────────────────────────
         // вот здесь мы явно передаём все три cfg.position_N.clone()
@@ -265,6 +271,7 @@ pub async fn record_position_metrics(
             commission3,
             total_value_current,              // total_value_open
             total_value_current,              // total_value_current
+            wallet_balance
         )
         .await?;
     } else {
@@ -324,4 +331,22 @@ pub async fn update_total_value_current(
         .execute(&*DB)
         .await?;
     Ok(())
+}
+
+/// Записать новое значение wallet_balance
+pub async fn update_wallet_balance(new_balance: f64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE pool_configs SET wallet_balance = ?1 WHERE id = 1")
+        .bind(new_balance)
+        .execute(&*DB)
+        .await?;
+    Ok(())
+}
+
+/// Получить текущее значение wallet_balance
+pub async fn get_wallet_balance() -> sqlx::Result<Option<f64>> {
+    let row = sqlx::query("SELECT wallet_balance FROM pool_configs WHERE id = 1")
+        .fetch_optional(&*DB)
+        .await?;
+    Ok(row
+        .and_then(|r| r.try_get::<f64, _>("wallet_balance").ok()))
 }

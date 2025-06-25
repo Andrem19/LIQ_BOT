@@ -19,9 +19,11 @@ pub const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 pub const KEYPAIR_FILENAME: &str = "/home/jupiter/.config/solana/mainnet-id.json";
 pub const OVR: f64 = 1.03;
 pub const PCT_LIST_1: [f64; 4] = [0.005, 0.002, 0.004, 0.014];
-pub const PCT_LIST_2: [f64; 4] = [0.003, 0.002, 0.004, 0.01];
+pub const PCT_LIST_2: [f64; 4] = [0.004, 0.006, 0.006, 0.01];
+pub const PCT_NUMBER: u16 = 2;
 pub const WEIGHTS: [f64; 3] = [10.0, 25.0, 65.0];
-pub const AMOUNT: f64 = 250.0;
+pub const AMOUNT: f64 = 1400.0;
 pub const POOL_NUMBER: u16 = 2;
+pub const INFO_INTERVAL: u16 = 5;
 
 

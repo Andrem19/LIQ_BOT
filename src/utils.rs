@@ -3,9 +3,16 @@ use std::sync::Arc;
 use solana_sdk::instruction::Instruction;
 use std::sync::atomic::AtomicUsize;
 use anyhow::{anyhow, Result};
+use crate::types::{RangeAlloc, PriceBound, BoundType};
+use serde_json::Value;
+use std::time::{Instant};
+use crate::params::WSOL as SOL_MINT;
+use crate::types::Role;
+use crate::wirlpool_services::net::http_client;
 use once_cell::sync::Lazy;
 use crate::params;
 use std::sync::atomic::Ordering;
+use anyhow::Context;
 use tokio::time::Duration;
 use spl_associated_token_account::get_associated_token_address;
 use solana_sdk::account::Account;
@@ -14,6 +21,7 @@ use solana_sdk::{
     signature::{read_keypair_file, Keypair},
     transaction::Transaction,
 };
+use crate::types::WalletBalanceInfo;
 use crate::params::{WSOL, USDC};
 use crate::wirlpool_services::swap;
 use std::str::FromStr;
@@ -24,6 +32,8 @@ use solana_sdk::message::Message;
 use orca_tx_sender::CommitmentConfig;
 
 pub static RPC_ROTATOR: Lazy<RpcRotator> = Lazy::new(RpcRotator::new);
+static PRICE_CACHE: Lazy<tokio::sync::RwLock<(f64, Instant)>> =
+    Lazy::new(|| tokio::sync::RwLock::new((0.0, Instant::now() - Duration::from_secs(60))));
 
 pub fn op<E: std::fmt::Display>(ctx: &'static str) -> impl FnOnce(E) -> anyhow::Error {
     move |e| anyhow!("{} failed: {}", ctx, e)
@@ -281,4 +291,183 @@ pub async fn swap_excess_to_usdc(
         }
         Err(e) => Err(anyhow!("swap failed for {}: {}", mint, e)),
     }
+}
+
+
+
+pub fn calc_bound_prices_struct(base_price: f64, pct_list: &[f64]) -> Vec<PriceBound> {
+    assert!(pct_list.len() == 4, "Нужно ровно 4 процента: [верх_внутр, низ_внутр, верх_экстр, низ_экстр]");
+
+    // Верхняя внутренняя граница (немного выше рынка)
+    let upper_inner = base_price * (1.0 + pct_list[0]);
+    // Нижняя внутренняя граница (немного ниже рынка)
+    let lower_inner = base_price * (1.0 - pct_list[1]);
+    // Верхняя экстремальная (ещё выше)
+    let upper_outer = upper_inner * (1.0 + pct_list[2]);
+    // Нижняя экстремальная (ещё ниже)
+    let lower_outer = lower_inner * (1.0 - pct_list[3]);
+
+    vec![
+        PriceBound { bound_type: BoundType::UpperOuter, value: upper_outer },
+        PriceBound { bound_type: BoundType::UpperInner, value: upper_inner },
+        PriceBound { bound_type: BoundType::LowerInner, value: lower_inner },
+        PriceBound { bound_type: BoundType::LowerOuter, value: lower_outer },
+    ]
+}
+
+
+
+pub fn calc_range_allocation_struct(
+    price: f64,
+    bounds: &[PriceBound],
+    weights: &[f64; 3],
+    total_usdc: f64,
+) -> Vec<RangeAlloc> {
+    // ─── 1. Выбираем нужные границы ────────────────────────────────────
+    let get = |t: BoundType| bounds.iter().find(|b| b.bound_type == t).unwrap().value;
+    let upper_outer = get(BoundType::UpperOuter);
+    let upper_inner = get(BoundType::UpperInner);
+    let lower_inner = get(BoundType::LowerInner);
+    let lower_outer = get(BoundType::LowerOuter);
+
+    // ─── 2. Верхний диапазон (Role::Up) ─────────────────────────────────
+    let up_weight = total_usdc * weights[0] / 100.0;
+    let up_sol    = up_weight / price;
+    let upper = RangeAlloc {
+        role: Role::Up,                           // ✱ ИЗМЕНЕНО
+        range_idx: 0,
+        usdc_amount: 0.0,
+        sol_amount: up_sol,
+        usdc_equivalent: up_sol * price,
+        upper_price: upper_outer,
+        lower_price: upper_inner,
+    };
+
+    // ─── 3. Центральный диапазон (Role::Middle) ────────────────────────
+    let mid_weight = total_usdc * weights[1] / 100.0;
+    let (sqrt_p, sqrt_l, sqrt_u) = (price.sqrt(), lower_inner.sqrt(), upper_inner.sqrt());
+    let span = sqrt_u - sqrt_l;
+    let usdc_val    = mid_weight * (sqrt_u - sqrt_p) / span;
+    let sol_val_usd = mid_weight * (sqrt_p - sqrt_l) / span;
+    let mid_sol     = sol_val_usd / price;
+
+    let middle = RangeAlloc {
+        role: Role::Middle,                       // ✱ ИЗМЕНЕНО
+        range_idx: 1,
+        usdc_amount: mid_weight - usdc_val,
+        sol_amount:  mid_sol,
+        usdc_equivalent: mid_weight,
+        upper_price: upper_inner,
+        lower_price: lower_inner,
+    };
+
+    // ─── 4. Нижний диапазон (Role::Down) ───────────────────────────────
+    let down_weight = total_usdc * weights[2] / 100.0;
+    let lower = RangeAlloc {
+        role: Role::Down,                         // ✱ ИЗМЕНЕНО
+        range_idx: 2,
+        usdc_amount: down_weight,
+        sol_amount: 0.0,
+        usdc_equivalent: down_weight,
+        upper_price: lower_inner,
+        lower_price: lower_outer,
+    };
+
+    vec![upper, middle, lower]      // порядок гарантирован
+}
+
+pub async fn get_sol_price_usd(mint: &str, fallback: bool) -> Result<f64> {
+    // -------- 0. быстрый взгляд в кэш -----------------------------------
+    {
+        let rd = PRICE_CACHE.read().await;
+        if rd.1.elapsed() < Duration::from_secs(30) && rd.0 > 0.0 {
+            return Ok(rd.0);
+        }
+    }
+
+    let client = http_client(); // ваша вспомогательная функция (reqwest::Client)
+
+    // -------- 1. пробуем Jupiter lite-api --------------------------------
+    let url = format!(
+        "https://lite-api.jup.ag/price/v2?ids={mint}"
+    );
+    if let Ok(resp) = client.get(&url).send().await {
+        if resp.status().is_success() {
+            let body = resp.text().await?;
+            let v: Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow!("Jupiter price JSON parse error: {e}  body={body}"))?;
+            if let Some(p_str) = v["data"][SOL_MINT]["price"].as_str() {
+                if let Ok(price) = p_str.parse::<f64>() {
+                    cache_price(price).await;
+                    return Ok(price);
+                }
+            }
+        }
+    }
+    if fallback {
+        // -------- 2. fallback → CoinGecko ------------------------------------
+        let cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+        let resp = client.get(cg_url).send().await?;
+        let body = resp.text().await?;
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("CoinGecko JSON parse error: {e}  body={body}"))?;
+        if let Some(price) = v["solana"]["usd"].as_f64() {
+            cache_price(price).await;
+            return Ok(price);
+        }
+    }
+
+    Err(anyhow!("cannot fetch SOL/USD price from Jupiter or CoinGecko"))
+}
+
+/// сохраняем значение в кэше
+async fn cache_price(p: f64) {
+    let mut wr = PRICE_CACHE.write().await;
+    *wr = (p, Instant::now());
+}
+
+/// Асинхронно собирает баланс SOL и USDC и конвертирует в USD.
+pub async fn fetch_wallet_balance_info() -> Result<WalletBalanceInfo> {
+    // 1) RPC и кошелёк
+    let rpc    = utils::init_rpc();
+    let wallet = utils::load_wallet().context("Failed to load wallet")?;
+    let pk     = wallet.pubkey();
+
+    // 2) SOL баланс
+    let lam = rpc
+        .get_balance(&pk)
+        .await
+        .context("Error fetching SOL balance")?;
+    let sol_balance = lam as f64 / 1e9;
+
+    // 3) USDC баланс
+    let mint_usdc = Pubkey::from_str(USDC)
+        .context("Invalid USDC mint")?;
+    let ata = get_associated_token_address(&pk, &mint_usdc);
+
+    let usdc_balance = rpc
+        .get_token_account_balance(&ata)
+        .await
+        .ok()
+        .and_then(|resp| resp.amount.parse::<f64>().ok())
+        .unwrap_or(0.0) / 1e6;
+
+    // 4) Цена SOL → USD
+    let sol_usd_price = get_sol_price_usd(WSOL, true)
+        .await
+        .context("Error fetching SOL/USD price")?;
+
+    // 5) Конвертация в доллары
+    let sol_in_usd   = sol_balance * sol_usd_price;
+    let usdc_in_usd  = usdc_balance; // USDC ≈ $1
+    let total_usd    = sol_in_usd + usdc_in_usd;
+
+    Ok(WalletBalanceInfo {
+        sol_balance,
+        usdc_balance,
+        sol_usd_price,
+        sol_in_usd,
+        usdc_in_usd,
+        total_usd,
+    })
 }

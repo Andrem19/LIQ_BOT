@@ -5,7 +5,7 @@ use crate::database::db::DB;
 use crate::database::positions::get_pool_config;
 use chrono::{DateTime, Utc};
 use chrono::Duration;
-
+use crate::utils;
 use chrono::NaiveDate;
 
 /// Одна запись о сессии открытия/закрытия позиции
@@ -69,6 +69,9 @@ pub async fn init_history_module() -> sqlx::Result<()> {
 /// commissions = сумма всех трёх commission_collected.
 pub async fn record_session_history() -> sqlx::Result<i64> {
     // 1) Получаем текущую конфигурацию
+    let end_wallet_balance: crate::types::WalletBalanceInfo = utils::fetch_wallet_balance_info().await.unwrap_or_default();
+    println!("Wallet Balance: {}", end_wallet_balance);
+
     let cfg_opt = get_pool_config().await?;
     let cfg: crate::types::PoolConfig = cfg_opt.ok_or_else(|| sqlx::Error::Protocol(
         "No pool config found to record history".into()
@@ -116,8 +119,8 @@ pub async fn record_session_history() -> sqlx::Result<i64> {
     .bind(&cfg.name)
     .bind(range_lower)
     .bind(range_upper)
-    .bind(cfg.total_value_open)
-    .bind(cfg.total_value_current)
+    .bind(cfg.wallet_balance)
+    .bind(end_wallet_balance.total_usd)
     .bind(commissions)
     .execute(&*DB)
     .await?;

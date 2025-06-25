@@ -1,6 +1,8 @@
+use ethers::contract::EthDisplay;
 use solana_sdk::pubkey::Pubkey;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Снимок состояния пула, который читает `reporter()`
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,7 +67,7 @@ pub struct PoolPositionInfo {
 //     pub decimal_a:             u16,
 //     pub decimal_b:             u16,
 // }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Role {
     Middle,
     Up,
@@ -121,18 +123,19 @@ pub struct PoolConfig {
     pub commission_collected_3:f64,
     pub total_value_open:      f64,
     pub total_value_current:   f64,
+    pub wallet_balance:   f64,
 }
 
 
 #[derive(Debug, Clone)]
 pub struct RangeAlloc {
-    pub range_idx: usize,
-    pub range_type: &'static str,
-    pub usdc_amount: f64,
-    pub sol_amount: f64,
-    pub usdc_equivalent: f64,
-    pub upper_price: f64,
-    pub lower_price: f64,
+    pub role: Role,          // ✱ ИЗМЕНЕНО: Up / Middle / Down
+    pub range_idx:  usize,   // числовой индекс-метка (0,1,2) – можно оставить
+    pub usdc_amount:       f64,   // «чистый» USDC (только для Middle)
+    pub sol_amount:        f64,   // «чистый» SOL   (только для Up / Down)
+    pub usdc_equivalent:   f64,   // стоимость диапазона в USDC
+    pub upper_price:       f64,
+    pub lower_price:       f64,
 }
 
 #[derive(Debug, Clone)]
@@ -164,4 +167,31 @@ pub struct OpenPositionResult {
     pub amount_wsol: f64,
     /// Объём USDC (в единицах токена, не в атомах)
     pub amount_usdc: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WalletBalanceInfo {
+    pub sol_balance:    f64,
+    pub usdc_balance:   f64,
+    pub sol_usd_price:  f64,
+    pub sol_in_usd:     f64,
+    pub usdc_in_usd:    f64,
+    pub total_usd:      f64,
+}
+
+impl fmt::Display for WalletBalanceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "🏦 Баланс кошелька:\n\
+             ► SOL: {:.4} (~${:.2})\n\
+             ► USDC: {:.4} (~${:.2})\n\
+             ► Всего: ≈ ${:.2}",
+            self.sol_balance,
+            self.sol_in_usd,
+            self.usdc_balance,
+            self.usdc_in_usd,
+            self.total_usd,
+        )
+    }
 }

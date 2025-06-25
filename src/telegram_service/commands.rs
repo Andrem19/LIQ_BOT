@@ -14,6 +14,8 @@ pub type CommandFunc = Arc<dyn Fn(Vec<String>) -> BoxFuture<'static, ()> + Send 
 pub struct Commander {
     /// Зарегистрированные команды
     commands: Arc<Mutex<HashMap<Vec<String>, CommandFunc>>>,
+    /// Описания для каждой команды (default: empty)
+    descriptions: Arc<Mutex<HashMap<Vec<String>, String>>>,
     /// Вести ли лог в stdout
     logs: bool,
     /// Момент запуска бота (Unix-секунды)
@@ -21,26 +23,27 @@ pub struct Commander {
     /// Окно «свежести» команды, сек. (по-умолчанию 5 с)
     fresh_window_secs: i64,
 }
-
 impl Clone for Commander {
-        fn clone(&self) -> Self {
-            Commander {
-                commands: Arc::clone(&self.commands),
-                logs: self.logs,
-                start_unix: AtomicI64::new(self.start_unix.load(Ordering::SeqCst)),
-                fresh_window_secs: self.fresh_window_secs,
-            }
+    fn clone(&self) -> Self {
+        Commander {
+            commands:     Arc::clone(&self.commands),
+            descriptions: Arc::clone(&self.descriptions),
+            logs:         self.logs,
+            start_unix:   AtomicI64::new(self.start_unix.load(Ordering::SeqCst)),
+            fresh_window_secs: self.fresh_window_secs,
         }
     }
+}
 
 impl Commander {
     /// Создаёт новый экземпляр.
     /// * `logs` — печатать ли в консоль успешные/неуспешные вызовы.
     pub fn new(logs: bool) -> Self {
         Commander {
-            commands: Arc::new(Mutex::new(HashMap::new())),
+            commands:     Arc::new(Mutex::new(HashMap::new())),
+            descriptions: Arc::new(Mutex::new(HashMap::new())),
             logs,
-            start_unix: AtomicI64::new(Utc::now().timestamp()),
+            start_unix:   AtomicI64::new(Utc::now().timestamp()),
             fresh_window_secs: 15,
         }
     }
@@ -56,6 +59,22 @@ impl Commander {
             cmd.iter().map(|s| s.to_string()).collect(),
             Arc::new(move |params: Vec<String>| func(params).boxed()),
         );
+    }
+
+    /// Регистрирует команду с описанием.
+    pub fn add_command_with_help<F, Fut>(&self, cmd: &[&str], help: &str, func: F)
+    where
+        F: Fn(Vec<String>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let key = cmd.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut cmds = self.commands.lock().unwrap();
+        cmds.insert(
+            key.clone(),
+            Arc::new(move |params: Vec<String>| func(params).boxed()),
+        );
+        let mut descs = self.descriptions.lock().unwrap();
+        descs.insert(key, help.to_string());
     }
 
     /// Разбирает строку на «ключевые» слова и параметры (`--param`).
@@ -118,12 +137,20 @@ impl Commander {
         }
     }
 
-    /// Возвращает дерево зарегистрированных команд (для справки / help).
+    /// Возвращает дерево команд с описаниями.
     pub fn show_tree(&self) -> String {
-        let map = self.commands.lock().unwrap();
-        map.keys()
-            .map(|k| k.join(" "))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let cmds = self.commands.lock().unwrap();
+        let descs = self.descriptions.lock().unwrap();
+        let mut lines = Vec::new();
+        for key in cmds.keys() {
+            let cmd_str = key.join(" ");
+            let help = descs.get(key).cloned().unwrap_or_default();
+            if help.is_empty() {
+                lines.push(cmd_str);
+            } else {
+                lines.push(format!("{} — {}", cmd_str, help));
+            }
+        }
+        lines.join("\n")
     }
 }

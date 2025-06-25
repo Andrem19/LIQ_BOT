@@ -5,7 +5,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::{str::FromStr, time::Duration};
 use anyhow::Result;
 use orca_whirlpools::PositionOrBundle;
-use crate::{exchange::helpers, types::PoolConfig};
+use crate::{database::triggers::Trigger, exchange::helpers, types::PoolConfig};
 use std::time::Instant;
 use std::sync::atomic::AtomicBool;
 use orca_whirlpools_core::U128;
@@ -21,7 +21,7 @@ use crate::database::positions::record_position_metrics;
 
 use crate::params::{WEIGHTS};
 use crate::types::{LiqPosition, Role};
-use crate::orca_logic::helpers::{calc_bound_prices_struct, calc_range_allocation_struct};
+use crate::utils::{calc_bound_prices_struct, calc_range_allocation_struct};
 use crate::wirlpool_services::wirlpool::{open_with_funds_check_universal, close_all_positions, list_positions_for_owner};
 use crate::wirlpool_services::get_info::fetch_pool_position_info;
 use crate::telegram_service::tl_engine::ServiceCommand;
@@ -36,7 +36,7 @@ use crate::utils::{safe_get_account, swap_excess_to_usdc};
 use std::sync::Arc;
 use spl_token::solana_program::program_pack::Pack;
 use crate::exchange::helpers::get_atr;
-use crate::orca_logic::helpers::get_sol_price_usd;
+use crate::utils::get_sol_price_usd;
 use crate::wirlpool_services::wirlpool::close_whirlpool_position;
 
 
@@ -158,92 +158,97 @@ pub async fn orchestrator_pool(
     let mut lower_exit = 0.0;
 
     if three_ranges && need_open_new {
-        
-        /* === трёх-диапазонное открытие для SOL/USDC ==================== */
-        let bounds = calc_bound_prices_struct(price, &pct_list);
-        let allocs = calc_range_allocation_struct(price, &bounds, &WEIGHTS, capital_usd);
-        
+        let bounds  = calc_bound_prices_struct(price, &pct_list);
+        let allocs  = calc_range_allocation_struct(price, &bounds, &WEIGHTS, capital_usd);  // ✱ ИЗМЕНЕНО: без sort
+
         let _ = tx_tg.send(ServiceCommand::SendMessage(
             format!("🔔 Пытаюсь открыть 3 позиции SOL/USDC ({} USDC)…", capital_usd)
         ));
-        
-        let mut minted: Vec<(usize, String)> = Vec::new();   // (index, mint)
+
+        let mut minted: Vec<Role> = Vec::new();   // ✱ ИЗМЕНЕНО: трекаем по роли
         let mut slippage = 150u16;
-        
-        'outer: for round in 1..=2 {                          // максимум 3 раунда
+
+        'outer: for round in 1..=2 {              // максимум 3 раунда
             let mut progress = false;
-        
-            for (idx, alloc) in allocs.iter().enumerate() {
-                if minted.iter().any(|&(i, _)| i == idx) { continue } // уже есть
-        
-                let deposit = if idx == 1 { alloc.usdc_amount } else { alloc.usdc_equivalent };
-        
+
+            // проходим в фиксированном порядке Up→Middle→Down
+            for alloc in &allocs {
+                if minted.contains(&alloc.role) { continue }     // уже открыта
+
+                // сколько USDC вносить
+                let deposit = match alloc.role {
+                    Role::Middle => alloc.usdc_amount,
+                    Role::Up | Role::Down => alloc.usdc_equivalent,
+                };
+
                 match open_with_funds_check_universal(
                     alloc.lower_price,
                     alloc.upper_price,
                     deposit,
                     pool_cfg.clone(),
                     slippage,
-                    idx,
+                    alloc.range_idx,              // ← просто для отладочных логов
                 ).await {
                     Ok(res) => {
-                        // ↓ запоминаем открытую
-                        minted.push((idx, res.position_mint.to_string()));
+                        minted.push(alloc.role.clone());  // ✱ ИЗМЕНЕНО
                         progress = true;
-        
+
                         let liq = LiqPosition {
-                            role: [Role::Up, Role::Middle, Role::Down][idx].clone(),
+                            role: alloc.role.clone(),
                             position_address: None,
                             position_nft:     None,
                             upper_price: alloc.upper_price,
                             lower_price: alloc.lower_price,
                         };
-                        match idx {
-                            0 => pool_cfg.position_1 = Some(liq),
-                            1 => pool_cfg.position_2 = Some(liq),
-                            _ => pool_cfg.position_3 = Some(liq),
+                        match alloc.role {
+                            Role::Up    => pool_cfg.position_1 = Some(liq),
+                            Role::Middle=> pool_cfg.position_2 = Some(liq),
+                            Role::Down  => pool_cfg.position_3 = Some(liq),
                         }
-        
+
                         let _ = tx_tg.send(ServiceCommand::SendMessage(
-                            format!("✅ Открыта P{} (mint {})", idx + 1, res.position_mint),
+                            format!("✅ Открыта {:?} (mint {})", alloc.role, res.position_mint), // ✱ ИЗМЕНЕНО
                         ));
                     }
                     Err(e) => {
                         let _ = tx_tg.send(ServiceCommand::SendMessage(
-                            format!("⚠️ P{} не открылась: {e}", idx + 1),
+                            format!("⚠️ {:?} не открылась: {e}", alloc.role),                 // ✱ ИЗМЕНЕНО
                         ));
                     }
                 }
-        
-                // маленький «кул-даун», чтобы цепочка tx успела пройти
+
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             }
-        
-            // если уже все 3 — выходим
-            if minted.len() == 3 { break 'outer; }
-        
-            // если не продвинулись — повышаем slippage
+
+            if minted.len() == 3 { break 'outer; }      // всё открыто
+
             if !progress { slippage += 100; }
-        
+
             let _ = tx_tg.send(ServiceCommand::SendMessage(
                 format!("🔄 Раунд {round} окончен, открыто {}/3. Slippage = {} bps", minted.len(), slippage)
             ));
         }
-        
+
         // окончательная проверка
         if minted.len() != 3 {
             let _ = tx_tg.send(ServiceCommand::SendMessage(
                 format!("❌ За 3 раунда открыто только {}/3. Закрываю то, что было.", minted.len())
             ));
-        
-            for &(_, ref pm) in &minted {
-                let _ = close_whirlpool_position(Pubkey::from_str(pm)?, 150u16).await;
+            for r in minted {
+                if let Some(pm) = match r {
+                    Role::Up    => &pool_cfg.position_1,
+                    Role::Middle=> &pool_cfg.position_2,
+                    Role::Down  => &pool_cfg.position_3,
+                }.as_ref().map(|p| &p.position_nft) {
+                    let _ = close_whirlpool_position(Pubkey::from_str(pm.as_ref().unwrap())?, 150u16).await;
+                }
             }
             bail!("Не удалось открыть все три диапазона");
         }
-        
+
         upper_exit = pool_cfg.position_1.as_ref().unwrap().upper_price;
         lower_exit = pool_cfg.position_3.as_ref().unwrap().lower_price;
+
     } else if need_open_new {
         // ── 1. Текущие границы в “SOL за токен-B” (display) ─────────────────
 
@@ -491,7 +496,8 @@ pub struct PoolReport {
     pub total:  f64,    // итоговая $-стоимость позиций
 }
 // reporter.rs
-pub async fn build_pool_report(cfg: &PoolConfig) -> Result<PoolReport> {
+pub async fn build_pool_report(cfg: &PoolConfig, tx_tg: UnboundedSender<ServiceCommand>, init_wallet_balance: f64) -> Result<PoolReport> {
+    let closing: triggers::Trigger  = triggers::get_trigger("closing").await?.unwrap_or(Trigger{state: false, ..Default::default()});
     // 1. RPC / Whirlpool
     let rpc      = utils::init_rpc();
     let whirl_pk = Pubkey::from_str(&cfg.pool_address)?;
@@ -510,6 +516,11 @@ pub async fn build_pool_report(cfg: &PoolConfig) -> Result<PoolReport> {
             text:  format!("📊 {} — позиций нет.\n", cfg.name),
             total: 0.0,
         });
+    }
+    if list.len() < 3 && closing.state == false {
+        _ = close_all_positions(250, None).await?;
+        _ = swap_excess_to_usdc(WSOL, 9, 0.05).await?;
+        let _ = tx_tg.send(ServiceCommand::SendSignal("Signal! list.len() < 3 && closing.state == false".to_string()));
     }
     let candels_1m = get_kline("SOLUSDT", 250, 1).await?;
 
@@ -577,7 +588,7 @@ pub async fn build_pool_report(cfg: &PoolConfig) -> Result<PoolReport> {
     let comm3 = infos.get(2).map(|i| i.sum).unwrap_or(0.0);
     let total_current = tv;
 
-    if let Err(e) = record_position_metrics(&db_cfg, comm1, comm2, comm3, total_current).await {
+    if let Err(e) = record_position_metrics(&db_cfg, comm1, comm2, comm3, total_current, init_wallet_balance).await {
         log::error!("Не удалось сохранить метрики для {}: {}", cfg.name, e);
     }
 

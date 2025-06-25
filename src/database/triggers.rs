@@ -6,7 +6,7 @@ use sqlx;
 use sqlx::Row;
 use crate::telegram_service::tl_engine::ServiceCommand;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Trigger {
     pub name:     String,
     pub state:    bool,
@@ -148,5 +148,104 @@ pub async fn open_position_switch(switch: bool, tx: &UnboundedSender<ServiceComm
             ));
         }
     }
+    Ok(())
+}
+
+pub async fn closing_switcher(
+    switch: bool,
+    tx: Option<&UnboundedSender<ServiceCommand>>,
+) -> Result<()> {
+    // Формируем триггер
+    let t = Trigger {
+        name: "closing".into(),
+        state: switch,
+        position: String::default(),
+    };
+
+    // Пытаемся сохранить/обновить
+    match upsert_trigger(&t).await {
+        Ok(_) => {
+            if let Some(tx) = tx {
+                // Если передан канал — шлём сообщение
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "✅ Trigger `closing_switcher` enabled".into(),
+                ));
+            }
+        }
+        Err(e) => {
+            if let Some(tx) = tx {
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    format!("❌ Failed to enable trigger closing_switcher: {}", e),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn new_position_switcher(
+    switch: bool,
+    tx: Option<&UnboundedSender<ServiceCommand>>,
+) -> Result<()> {
+    // Формируем триггер
+    let t = Trigger {
+        name: "new_position".into(),
+        state: switch,
+        position: String::default(),
+    };
+
+    // Пытаемся сохранить/обновить
+    match upsert_trigger(&t).await {
+        Ok(_) => {
+            if let Some(tx) = tx {
+                // Если передан канал — шлём сообщение
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "✅ Trigger `new_position_switcher` enabled".into(),
+                ));
+            }
+        }
+        Err(e) => {
+            if let Some(tx) = tx {
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    format!("❌ Failed to enable trigger new_position_switcher: {}", e),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn limit_switcher(
+    switch: bool,
+    tx: Option<&UnboundedSender<ServiceCommand>>,
+) -> Result<()> {
+    // Формируем триггер
+    let t = Trigger {
+        name: "limit".into(),
+        state: switch,
+        position: String::default(),
+    };
+
+    // Пытаемся сохранить/обновить
+    match upsert_trigger(&t).await {
+        Ok(_) => {
+            if let Some(tx) = tx {
+                // Если передан канал — шлём сообщение
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    "✅ Trigger `limit` changed".into(),
+                ));
+            }
+        }
+        Err(e) => {
+            if let Some(tx) = tx {
+                let _ = tx.send(ServiceCommand::SendMessage(
+                    format!("❌ Failed to enable trigger limit: {}", e),
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
