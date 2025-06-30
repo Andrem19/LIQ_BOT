@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::time::{Instant};
 use crate::params::WSOL as SOL_MINT;
 use crate::types::Role;
-use crate::wirlpool_services::net::http_client;
+use crate::dex_services::net::http_client;
 use once_cell::sync::Lazy;
 use crate::params;
 use std::sync::atomic::Ordering;
@@ -23,7 +23,7 @@ use solana_sdk::{
 };
 use crate::types::WalletBalanceInfo;
 use crate::params::{WSOL, USDC};
-use crate::wirlpool_services::swap;
+use crate::dex_services::swap;
 use std::str::FromStr;
 use orca_tx_sender::Signer;
 use orca_tx_sender::ComputeBudgetInstruction;
@@ -256,46 +256,99 @@ pub async fn swap_excess_to_usdc(
     dec:  u8,
     keep_amount: f64,
 ) -> Result<String> {
-    // 1) Загружаем кошелёк и RPC
-    let payer: Keypair = utils::load_wallet()
+    use anyhow::{anyhow, Context};
+    use tokio::time::{sleep, Duration};
+    use solana_sdk::{signer::keypair::Keypair, pubkey::Pubkey};
+
+    const MAX_ATTEMPTS   : u8  = 3;     // сколько раз пробуем своп
+    const FEE_BUFFER_SOL : f64 = 0.10;  // базовый буфер SOL (увеличивается с каждой попыткой)
+
+    // ─── инициализация ───────────────────────────────────────────────
+    let payer : Keypair = utils::load_wallet()
         .map_err(|e| anyhow!("failed to load wallet: {}", e))?;
-    let wallet: Pubkey = payer.pubkey();
-    let rpc = utils::init_rpc();
+    let wallet: Pubkey  = payer.pubkey();
+    let rpc             = utils::init_rpc();
 
-    // 2) Узнаём текущий баланс mint-а
-    let balance = get_token_balance(&rpc, &wallet, mint, dec).await?;
-    if balance <= keep_amount {
-        return Ok(format!(
-            "🔔 {} balance is {:.6}, which is ≤ keep_amount {:.6}. No swap.",
-            mint, balance, keep_amount
-        ));
-    }
+    let mut last_err: Option<anyhow::Error> = None;
 
-    // 3) Считаем, сколько нужно свопнуть
-    let to_swap = balance - keep_amount;
+    // ─── цикл ретраев ────────────────────────────────────────────────
+    for attempt in 1..=MAX_ATTEMPTS {
+        log::debug!("swap_excess_to_usdc; attempt {}/{}", attempt, MAX_ATTEMPTS);
 
-    // 4) Пытаемся сделать своп → USDC
-    match swap::execute_swap_tokens(mint, USDC, to_swap).await {
-        Ok(res) => {
-            // res.balance_sell — остаток sell-token после свопа
-            Ok(format!(
-                "🔁 Swapped {:.6} {} → USDC.\n\
-                 Remaining {} balance: {:.6}\n\
-                 USDC received (approx): {:.6}",
-                to_swap,
-                mint,
-                mint,
-                res.balance_sell,
-                res.balance_buy
-            ))
+        // 1) актуальный баланс токена
+        let balance = match get_token_balance(&rpc, &wallet, mint, dec).await {
+            Ok(bal) => bal,
+            Err(e)  => {
+                last_err = Some(anyhow!("failed to get balance for {}: {}", mint, e));
+                if attempt < MAX_ATTEMPTS {
+                    log::info!(
+                        "Attempt {}/{}: balance error: {}. Retry in 1 s …",
+                        attempt, MAX_ATTEMPTS, e
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        };
+
+        // 2) динамический буфер: 0.10 SOL, затем 0.20 SOL, затем 0.30 SOL …
+        let dyn_buffer = if mint == WSOL {
+            FEE_BUFFER_SOL * attempt as f64
+        } else {
+            0.0
+        };
+
+        // 3) своп не нужен или нечего продавать
+        if balance <= keep_amount + dyn_buffer {
+            return Ok(format!(
+                "🔔 {} balance {:.6} ≤ keep {:.6} + buffer {:.3}. Swap not required.",
+                mint, balance, keep_amount, dyn_buffer
+            ));
         }
-        Err(e) => Err(anyhow!("swap failed for {}: {}", mint, e)),
+
+        // 4) к продаже отдаём всё «лишнее», но оставляем буфер
+        let to_swap = balance - keep_amount - dyn_buffer;
+
+        // 5) пробуем выполнить своп
+        match swap::execute_swap_tokens(mint, USDC, to_swap).await {
+            Ok(res) => {
+                return Ok(format!(
+                    "🔁 Swapped {:.6} {} → USDC.\n\
+                     Buffered {:.3} SOL for fees.\n\
+                     Remaining {} balance: {:.6}\n\
+                     USDC received (approx): {:.6}",
+                    to_swap,
+                    mint,
+                    dyn_buffer,
+                    mint,
+                    res.balance_sell,
+                    res.balance_buy
+                ));
+            }
+            Err(e) => {
+                last_err = Some(anyhow!("swap failed for {}: {}", mint, e));
+                if attempt < MAX_ATTEMPTS {
+                    log::info!(
+                        "Attempt {}/{}: swap error: {}. Retry in 1 s …",
+                        attempt, MAX_ATTEMPTS, e
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
+        }
     }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("swap_excess_to_usdc failed")))
 }
 
 
 
-pub fn calc_bound_prices_struct(base_price: f64, pct_list: &[f64]) -> Vec<PriceBound> {
+
+
+pub fn calc_bound_prices_struct(base_price: f64, pct_list: &[f64], compress: bool) -> Vec<PriceBound> {
     assert!(pct_list.len() == 4, "Нужно ровно 4 процента: [верх_внутр, низ_внутр, верх_экстр, низ_экстр]");
 
     // Верхняя внутренняя граница (немного выше рынка)
@@ -303,9 +356,29 @@ pub fn calc_bound_prices_struct(base_price: f64, pct_list: &[f64]) -> Vec<PriceB
     // Нижняя внутренняя граница (немного ниже рынка)
     let lower_inner = base_price * (1.0 - pct_list[1]);
     // Верхняя экстремальная (ещё выше)
-    let upper_outer = upper_inner * (1.0 + pct_list[2]);
+    let upper_outer = if compress {base_price * (1.0 + pct_list[2])} else { upper_inner * (1.0 + pct_list[2])};
     // Нижняя экстремальная (ещё ниже)
-    let lower_outer = lower_inner * (1.0 - pct_list[3]);
+    let lower_outer = if compress { base_price * (1.0 - pct_list[3]) } else { lower_inner * (1.0 - pct_list[3]) };
+
+    vec![
+        PriceBound { bound_type: BoundType::UpperOuter, value: upper_outer },
+        PriceBound { bound_type: BoundType::UpperInner, value: upper_inner },
+        PriceBound { bound_type: BoundType::LowerInner, value: lower_inner },
+        PriceBound { bound_type: BoundType::LowerOuter, value: lower_outer },
+    ]
+}
+
+pub fn calc_bound_prices_struct_for_two(base_price: f64, pct_list: &[f64]) -> Vec<PriceBound> {
+    assert!(pct_list.len() == 4, "Нужно ровно 4 процента: [верх_внутр, низ_внутр, верх_экстр, низ_экстр]");
+
+    // Верхняя внутренняя граница (немного выше рынка)
+    let upper_inner = base_price * (1.0 + pct_list[0]);
+    // Нижняя внутренняя граница (немного ниже рынка)
+    let lower_inner = base_price * (1.0 - pct_list[1]);
+    // Верхняя экстремальная (ещё выше)
+    let upper_outer = base_price * (1.0 + pct_list[2]);
+    // Нижняя экстремальная (ещё ниже)
+    let lower_outer = base_price * (1.0 - pct_list[3]);
 
     vec![
         PriceBound { bound_type: BoundType::UpperOuter, value: upper_outer },
@@ -317,12 +390,76 @@ pub fn calc_bound_prices_struct(base_price: f64, pct_list: &[f64]) -> Vec<PriceB
 
 
 
+pub fn calc_range_allocation_struct_for_two(
+    price: f64,
+    bounds: &[PriceBound],
+    weights: &Vec<f64>,
+    total_usdc: f64,
+) -> Vec<RangeAlloc> {
+    println!("total_usdc: {}", total_usdc);
+
+    // ─── 1. Берём границы по типу ────────────────────────────────────
+    let get = |t: BoundType| bounds.iter().find(|b| b.bound_type == t).unwrap().value;
+    let upper_outer = get(BoundType::UpperOuter);
+    let upper_inner = get(BoundType::UpperInner);
+    let lower_inner = get(BoundType::LowerInner);
+    let lower_outer = get(BoundType::LowerOuter);
+
+    // ─── 2. Малый центральный диапазон (MiddleSmall) ────────────────────────
+    let small_weight = total_usdc * weights[0] / 100.0;
+    // используем inner-границы
+    let (sqrt_p, sqrt_l_small, sqrt_u_small) =
+        (price.sqrt(), lower_inner.sqrt(), upper_inner.sqrt());
+    let span_small = sqrt_u_small - sqrt_l_small;
+    let usdc_val_small    = small_weight * (sqrt_u_small - sqrt_p) / span_small;
+    let sol_val_usd_small = small_weight * (sqrt_p - sqrt_l_small) / span_small;
+    // ПРАВКА: умножаем на price (SOL за 1 USDC)
+    let sol_amount_small  = sol_val_usd_small * price;
+
+    let small = RangeAlloc {
+        role: Role::MiddleSmall,
+        range_idx: 0,
+        usdc_amount: small_weight - usdc_val_small,
+        sol_amount:  sol_amount_small,
+        usdc_equivalent: small_weight,
+        upper_price: upper_inner,
+        lower_price: lower_inner,
+    };
+
+    // ─── 3. Большой центральный диапазон (Middle) ─────────────────────────
+    let mid_weight = total_usdc * weights[1] / 100.0;
+    // теперь используем outer-границы
+    let (sqrt_p, sqrt_l_large, sqrt_u_large) =
+        (price.sqrt(), lower_outer.sqrt(), upper_outer.sqrt());
+    let span_large = sqrt_u_large - sqrt_l_large;
+    let usdc_val_large    = mid_weight * (sqrt_u_large - sqrt_p) / span_large;
+    let sol_val_usd_large = mid_weight * (sqrt_p - sqrt_l_large) / span_large;
+    // ТАК ЖЕ умножаем на price
+    let sol_amount_large  = sol_val_usd_large * price;
+
+    let large = RangeAlloc {
+        role: Role::Middle,
+        range_idx: 1,
+        usdc_amount: mid_weight - usdc_val_large,
+        sol_amount:  sol_amount_large,
+        usdc_equivalent: mid_weight,
+        upper_price: upper_outer,
+        lower_price: lower_outer,
+    };
+
+    println!("middle_small: {}   middle: {}", small.usdc_equivalent, large.usdc_equivalent);
+    vec![small, large]
+}
+
+
 pub fn calc_range_allocation_struct(
     price: f64,
     bounds: &[PriceBound],
-    weights: &[f64; 3],
+    weights: &Vec<f64>,
     total_usdc: f64,
+    compress: bool
 ) -> Vec<RangeAlloc> {
+    println!("total_usdc: {}", total_usdc);
     // ─── 1. Выбираем нужные границы ────────────────────────────────────
     let get = |t: BoundType| bounds.iter().find(|b| b.bound_type == t).unwrap().value;
     let upper_outer = get(BoundType::UpperOuter);
@@ -333,14 +470,14 @@ pub fn calc_range_allocation_struct(
     // ─── 2. Верхний диапазон (Role::Up) ─────────────────────────────────
     let up_weight = total_usdc * weights[0] / 100.0;
     let up_sol    = up_weight / price;
-    let upper = RangeAlloc {
+    let upper: RangeAlloc = RangeAlloc {
         role: Role::Up,                           // ✱ ИЗМЕНЕНО
         range_idx: 0,
         usdc_amount: 0.0,
         sol_amount: up_sol,
         usdc_equivalent: up_sol * price,
         upper_price: upper_outer,
-        lower_price: upper_inner,
+        lower_price: if compress { price * 1.0001 } else { upper_inner },
     };
 
     // ─── 3. Центральный диапазон (Role::Middle) ────────────────────────
@@ -369,10 +506,10 @@ pub fn calc_range_allocation_struct(
         usdc_amount: down_weight,
         sol_amount: 0.0,
         usdc_equivalent: down_weight,
-        upper_price: lower_inner,
+        upper_price: if compress { price * 0.9999 } else {lower_inner},
         lower_price: lower_outer,
     };
-
+    println!("upper: {} middle: {} lower: {}", upper.usdc_equivalent, middle.usdc_equivalent, lower.usdc_equivalent);
     vec![upper, middle, lower]      // порядок гарантирован
 }
 

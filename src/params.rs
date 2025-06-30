@@ -1,5 +1,5 @@
 use std::time::Duration;
-use crate::types::PoolConfig;
+use crate::types::{PoolConfig, Range};
 use crate::types::{LiqPosition, Role};
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
@@ -18,12 +18,23 @@ pub const WBTC: &str = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"; //8
 pub const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 pub const KEYPAIR_FILENAME: &str = "/home/jupiter/.config/solana/mainnet-id.json";
 pub const OVR: f64 = 1.03;
-pub const PCT_LIST_1: [f64; 4] = [0.005, 0.002, 0.004, 0.014];
-pub const PCT_LIST_2: [f64; 4] = [0.004, 0.006, 0.006, 0.01];
-pub const PCT_NUMBER: u16 = 2;
-pub const WEIGHTS: [f64; 3] = [10.0, 25.0, 65.0];
-pub const AMOUNT: f64 = 1400.0;
+pub const PCT_LIST_1: [f64; 4] = [0.001, 0.003, 0.006, 0.004];
+pub const PCT_LIST_2: [f64; 4] = [0.002, 0.002, 0.007, 0.007];
+pub const PCT_NUMBER: u16 = 1;
+pub fn weights_1() -> Vec<f64> {
+    vec![25.0, 20.0, 55.0]
+}
+
+/// Второй вектор весов
+pub fn weights_2() -> Vec<f64> {
+    vec![80.0, 20.0]
+}
+
+pub const WEIGHTS_NUMBER: u16 = 1;
+pub const AMOUNT: f64 = 200.0;
 pub const POOL_NUMBER: u16 = 2;
 pub const INFO_INTERVAL: u16 = 5;
+pub const COMPRESS: bool = false;
+pub const RANGE: Range = Range::Three;
 
 

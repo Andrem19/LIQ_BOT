@@ -2,14 +2,16 @@
 mod params;
 mod types;
 mod telegram_service;
-mod wirlpool_services;
+mod dex_services;
 mod exchange;
 mod orchestrator;
+
 
 pub mod utils;
 pub mod database;
 pub mod pyth_ws;
 pub mod strategies;
+pub mod comp_strategy;
 
 // ─── External and standard imports ─────────────────────────────────────────
 use std::{
@@ -19,31 +21,35 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-
+use sqlx::Error;
+use tokio::time::Instant;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use dotenv::dotenv;
 use tokio::{
-    sync::{mpsc::UnboundedSender, Notify},
+    sync::{mpsc::UnboundedSender, Notify, RwLock},
     time::{sleep, Duration},
 };
 
 // ─── Local crate imports ────────────────────────────────────────────────────
 use crate::{
-    params::{USDC, WSOL},
-    types::PoolConfig,
     database::{
-        triggers::{self, Trigger},
-        positions,
-        history,
-        general_settings,
-    },
-    strategies::limit_order::is_limit_trigger_satisfied,
-    telegram_service::tl_engine::ServiceCommand,
+        general_settings, history, positions, triggers::{self, Trigger}
+    }, params::{RANGE, USDC, WSOL}, strategies::limit_order::is_limit_trigger_satisfied, telegram_service::tl_engine::ServiceCommand, types::{PoolConfig, Range}
 };
+use crate::exchange::helpers::Candle;
+use crate::exchange::helpers::decide;
+use crate::exchange::helpers::{get_atr, range_coefficient, calculate_price_bounds, Mode};
+use crate::exchange::helpers::get_rsi;
+use crate::comp_strategy::stream_candles;
+use crate::exchange::helpers::convert_timeframe;
+use crate::exchange::helpers::Unzip5;
 
 const POST_CLOSE_RESTART_DELAY:  u64 = 10;
-const RPC_RETRY_DELAY:           u64 = 15;
+const RPC_RETRY_DELAY:           u64 = 20;
+const LOOKBACK_1M: usize = 30;    // сколько 1-минуток держим в расчёте
+const ATR_PER: usize     = 14;
+const RSI_PER: usize     = 14;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,17 +61,18 @@ async fn main() -> Result<()> {
     let (tx_tg, _commander) = telegram_service::tl_engine::start(close_notify.clone());
 
     let need_new_pos = Arc::new(AtomicBool::new(false)); //true - будут открываться новые при запуске; false - не будут
-    let auto_trade = false;
+    let auto_trade = true;
 
     init_default_triggers(&need_new_pos, auto_trade).await?;
     let init_wallet_balance = utils::fetch_wallet_balance_info().await?;
     println!("Wallet Balance: {}", init_wallet_balance);
+    let _ = tx_tg.send(ServiceCommand::SendMessage(init_wallet_balance.to_string()));
 
     let solusdc_cfg = make_solusdc_config()?;
     let report_cfgs = vec![solusdc_cfg.clone()];
 
     tokio::spawn(run_pool_with_restart(
-        solusdc_cfg.clone(), true, 
+        solusdc_cfg.clone(), 
         tx_tg.clone(), need_new_pos.clone(), close_notify.clone(), 1, Some(0.03)
     ));
 
@@ -84,31 +91,25 @@ async fn main() -> Result<()> {
             let mut counter = 0;
 
             loop {
-                let auto_trade = matches!(
-                    triggers::get_trigger("auto_trade").await,
-                    Ok(Some(t)) if t.state
-                );
-                match triggers::get_trigger("position_start_open").await {
-                    Ok(Some(tr)) if tr.state && !auto_trade => break, // выходим, если триггер включён
-                    Ok(_) => {
-                        // либо нет записи, либо state=false
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                    Err(e) => {
-                        // не удалось прочитать из БД — логируем, ждём и пробуем снова
-                        log::error!("Error reading trigger: {}", e);
-                        sleep(Duration::from_secs(5)).await;
-                    }
+
+                let auto_trade = triggers::get_trigger("auto_trade").await;
+                let pool_report_run = triggers::get_trigger("pool_report_run").await;
+                if pool_report_run.state && !auto_trade.state {
+                    break;
+                } else {
+                    sleep(Duration::from_secs(1)).await;
                 }
             }
     
             loop {
-                let new_position_state = matches!(
-                    triggers::get_trigger("new_position").await,
-                    Ok(Some(t)) if t.state
-                );
 
-                if !new_position_state  {
+                let report_info_reset = triggers::get_trigger("report_info_reset").await;
+                let opening = triggers::get_trigger("opening").await;
+                if opening.state {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                if !report_info_reset.state  {
                     let mins = match general_settings::get_general_settings().await {
                         Ok(Some(cfg)) => cfg.info_interval,
                         _             => 5,
@@ -121,6 +122,13 @@ async fn main() -> Result<()> {
                 // 1) собираем отчёты
                 let mut grand_total = 0.0;
                 let mut msg = String::new();
+
+                let trig = triggers::get_trigger("pool_report_run").await;
+
+                if !trig.state {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
     
                 for cfg in &report_cfgs {
                     match orchestrator::build_pool_report(cfg, tx_tg.clone(), init_wallet_balance.total_usd).await {
@@ -132,15 +140,16 @@ async fn main() -> Result<()> {
                             &format!("⚠️ report for {} failed: {e}\n", cfg.name)),
                     }
                 }
+                
     
                 // 2) считаем profit и поддерживаем «кольцевой буфер»
                 let mut profit = 0.0;
 
                 
-                if new_position_state {
+                if report_info_reset.state {
                     first_loop = true;
                     last_profits.clear();
-                    let _ = triggers::new_position_switcher(false, None).await;
+                    let _ = triggers::report_info_reset(false, None).await;
                 }
 
                 
@@ -172,6 +181,7 @@ async fn main() -> Result<()> {
                 ));
                 let _ = tx_tel.send(ServiceCommand::SendMessage(msg));
             }
+            
         }
     });
 
@@ -183,7 +193,6 @@ async fn main() -> Result<()> {
 
 async fn run_pool_with_restart(
     cfg:        PoolConfig,
-    three_rng:  bool,
     tx_tg:      UnboundedSender<ServiceCommand>,
     need_new: Arc<AtomicBool>,
     close_ntf:  Arc<Notify>,
@@ -191,28 +200,91 @@ async fn run_pool_with_restart(
     range: Option<f32>,
 ) -> Result<()> {
     use tokio::time::{sleep, Duration};
+
+    let mut candles_arc: Option<Arc<RwLock<Vec<Candle>>>> = None;
+    let report_interval = Duration::from_secs(300);
+    let mut last_report = Instant::now() - report_interval;
     
     loop {
-        if let Some(t) = triggers::get_trigger("auto_trade").await? {
-            println!("Got: {:?}", t);
-            let limit = is_limit_trigger_satisfied().await?;
-            if limit && t.state {
-                triggers::auto_trade_switch(false, &tx_tg).await?;
-                triggers::limit_switcher(false, Some(&tx_tg)).await?;
-            } else if t.state == true {
+        let auto_trade = triggers::get_trigger("auto_trade").await;
+
+        println!("Got: {:?}", auto_trade);
+        let limit = is_limit_trigger_satisfied(&tx_tg).await?;
+        if limit && auto_trade.state {
+            need_new.store(true, Ordering::SeqCst);
+            triggers::auto_trade_switch(false, None).await?;
+            triggers::limit_switcher(false, Some(&tx_tg)).await?;
+        } else if auto_trade.state == true {
+            if candles_arc.is_none() {
+                candles_arc = Some(stream_candles("SOLUSDT", 1, 300).await?); // ★
+            }
+
+            // читаем последние LOOKBACK_1M баров
+            let ready = {
+                let src = {
+                    let guard = candles_arc.as_ref().unwrap().read().await;
+                    guard.iter()
+                            .rev()
+                            .take(LOOKBACK_1M)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                };
+                if src.len() == LOOKBACK_1M {
+                    let (o,h,l,c,v) = src.iter()
+                        .map(|c| (c.open,c.high,c.low,c.close,c.volume))
+                        .unzip5();
+                    let (o5,h5,l5,c5,v5) = convert_timeframe(&o,&h,&l,&c,&v,5,0);
+                    let atr = get_atr(&o5,&h5,&l5,&c5,&v5,ATR_PER)?;
+                    let atr_last = atr[atr.len()-1];
+                    let (pr_up, pr_low) = calculate_price_bounds(c[c.len()-1]);
+                    println!("pr_up: {:.2} pr_low: {:.2}", pr_up, pr_low);
+                    let centre_kof = range_coefficient(&o,&h,&l,&c, 70, pr_low, pr_up, Mode::Full).unwrap();
+                    println!("Ждем вход в позицию ATR: {} CNT: {}", &atr_last, &centre_kof);
+
+                    if last_report.elapsed() >= report_interval {
+                        let msg = format!(
+                            "📊 ATR: {:.6}\n📈 CNT: {:.6}",
+                            atr_last,
+                            centre_kof
+                        );
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(msg));
+                        last_report = Instant::now();
+                    }
+
+                    centre_kof > 0.99 && atr_last < 0.40            // ← true / false
+                } else { 
+                    false 
+                }
+            };
+
+            if !ready {
+                // ждём и начинаем итерацию заново
                 sleep(Duration::from_secs(RPC_RETRY_DELAY)).await;
                 continue;
+            } else {
+                need_new.store(true, Ordering::SeqCst);
+                // «решение принято» — стрим больше не нужен
+                triggers::auto_trade_switch(false, None).await?;
+                candles_arc = None;             // ★ drop Arc => ws завершается
             }
         }
-        triggers::new_position_switcher(true, Some(&tx_tg.clone())).await?;
+        triggers::report_info_reset(true, Some(&tx_tg.clone())).await?;
 
         let settings = general_settings::get_general_settings().await?
         .context("General settings not found in database")?;
-        let amount: f64       = settings.amount;
+
         let pct: [f64; 4]   = if settings.pct_number == 1 {settings.pct_list_1} else { settings.pct_list_2 };
 
+
+        triggers::opening_switcher(true, Some(&tx_tg)).await?;
+
+        let weights = if RANGE == Range::Two {params::weights_2()} else if RANGE == Range::Three {params::weights_1()} else {params::weights_1()};
+
         let res = orchestrator::orchestrator_pool(
-            cfg.clone(), amount, pct, three_rng, tx_tg.clone(), need_new.clone(), close_ntf.clone(), min_restart, range
+            cfg.clone(), settings.amount, pct, weights, tx_tg.clone(), need_new.clone(), close_ntf.clone(), min_restart, range, settings.compress
         ).await;
 
         match res {
@@ -280,11 +352,12 @@ async fn init_default_triggers(need_new_pos: &Arc<AtomicBool>, auto_trade: bool)
         Ok(())
     }
 
-    upsert("position_start_open", new_pos_flag).await?;
+    upsert("pool_report_run", new_pos_flag).await?;
     upsert("closing",              false        ).await?;
     upsert("limit",                false        ).await?;
-    upsert("new_position",         true         ).await?;
+    upsert("report_info_reset",         true         ).await?;
     upsert("auto_trade",         auto_trade         ).await?;
+    upsert("opening",         false         ).await?;
 
     Ok(())
 }

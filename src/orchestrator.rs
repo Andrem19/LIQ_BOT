@@ -5,7 +5,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::{str::FromStr, time::Duration};
 use anyhow::Result;
 use orca_whirlpools::PositionOrBundle;
-use crate::{database::triggers::Trigger, exchange::helpers, types::PoolConfig};
+use crate::{database::triggers::Trigger, exchange::helpers, types::PoolConfig, utils::{calc_bound_prices_struct_for_two, calc_range_allocation_struct_for_two}};
 use std::time::Instant;
 use std::sync::atomic::AtomicBool;
 use orca_whirlpools_core::U128;
@@ -16,14 +16,16 @@ use crate::exchange::helpers::get_kline;
 use crate::orchestrator::helpers::convert_timeframe;
 use anyhow::Context;
 use crate::pyth_ws::subscribe;
+use tokio::time::sleep;
 use std::sync::atomic::Ordering;
 use crate::database::positions::record_position_metrics;
 
-use crate::params::{WEIGHTS};
+use crate::params::RANGE;
+use crate::types::Range;
 use crate::types::{LiqPosition, Role};
 use crate::utils::{calc_bound_prices_struct, calc_range_allocation_struct};
-use crate::wirlpool_services::wirlpool::{open_with_funds_check_universal, close_all_positions, list_positions_for_owner};
-use crate::wirlpool_services::get_info::fetch_pool_position_info;
+use crate::dex_services::wirlpool::{open_with_funds_check_universal, close_all_positions, list_positions_for_owner};
+use crate::dex_services::get_info::fetch_pool_position_info;
 use crate::telegram_service::tl_engine::ServiceCommand;
 use tokio::sync::mpsc::UnboundedSender;
 use spl_token::state::Mint;
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use spl_token::solana_program::program_pack::Pack;
 use crate::exchange::helpers::get_atr;
 use crate::utils::get_sol_price_usd;
-use crate::wirlpool_services::wirlpool::close_whirlpool_position;
+use crate::dex_services::wirlpool::close_whirlpool_position;
 
 
 fn get_pyth_feed_id(symbol: &str) -> &'static str {
@@ -55,28 +57,45 @@ async fn close_and_report(
     tx_tg: &UnboundedSender<ServiceCommand>,
     lower: bool,
 ) -> Result<()> {
+    const MAX_CLOSE_ATTEMPTS: u8 = 4;
+    let mut attempt  = 1u8;
+    let mut slippage = 400u16;
     // 1) закрываем все позиции ЭТОГО пула
-    close_all_positions(150, Some(whirl_pk)).await?;
-    if lower {
-        let candels_1m = get_kline("SOLUSDT", 250, 1).await?;
-
-        let opens:   Vec<f64> = candels_1m.iter().map(|c| c.open).collect();
-        let highs:   Vec<f64> = candels_1m.iter().map(|c| c.high).collect();
-        let lows:    Vec<f64> = candels_1m.iter().map(|c| c.low).collect();
-        let closes:  Vec<f64> = candels_1m.iter().map(|c| c.close).collect();
-        let volumes: Vec<f64> = candels_1m.iter().map(|c| c.volume).collect();
-    
-        // 3) Конвертируем в hourly
-        let (o1h, h1h, l1h, c1h, v1h) =
-            convert_timeframe(&opens, &highs, &lows, &closes, &volumes, 5, 28);
-
-        let atr: Vec<f64> = get_atr(&o1h, &h1h, &l1h, &c1h, &v1h, 14)?;
-        let mean_atr_2 = (atr.last().unwrap() + atr.get(atr.len().wrapping_sub(2)).unwrap()) / 2.0;
-        if mean_atr_2 > 0.5 {
-            _ = swap_excess_to_usdc(WSOL, 9, 0.05).await?;
-            triggers::auto_trade_switch(true, tx_tg).await?;
-            let _ = tx_tg.send(ServiceCommand::SendSignal("Signal! Lower breakthrough".to_string()));
+    // ───────── блок закрытия позиций с ретраями ─────────
+    loop {
+        match close_all_positions(slippage, Some(whirl_pk)).await {
+            Ok(_) => {
+                let rem = list_positions_for_owner(Some(whirl_pk))
+                    .await
+                    .unwrap_or_default();
+                if rem.is_empty() {
+                    log::info!("Все позиции закрыты после {attempt}-й попытки");
+                    break;
+                }
+                log::info!("После {attempt}-й попытки осталось {}, усиливаем slippage", rem.len());
+            }
+            Err(e) => {
+                log::info!("Ошибка close_all_positions на попытке {attempt}: {e:?}");
+            }
         }
+
+        if attempt >= MAX_CLOSE_ATTEMPTS {
+            log::info!("⚠️ Не удалось закрыть все позиции за {attempt} попыток");
+            break;
+        }
+
+        attempt += 1;
+        slippage = slippage.saturating_mul(2);
+        sleep(Duration::from_secs(2)).await;
+    }
+
+    _ = triggers::pool_report_run(false, &tx_tg).await?;
+    _ = triggers::auto_trade_switch(true, None).await?;
+    _ = triggers::report_info_reset(true, None).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+    _ = swap_excess_to_usdc(WSOL, 9, 0.05).await?;
+    if lower {
+        let _ = tx_tg.send(ServiceCommand::SendSignal("Signal! Lower breakthrough".to_string()));
     }
 
     // 2) Балансы после закрытия
@@ -124,15 +143,16 @@ pub async fn orchestrator_pool(
     mut pool_cfg: PoolConfig,          // шаблон пула
     capital_usd: f64,                  // общий размер “кошелька” под пул
     pct_list: [f64; 4],                // как раньше (игнорируется для 1-диапаз.)
-    three_ranges: bool,                // true = SOL/USDC, false = RAY/SOL
+    weights: Vec<f64>, 
     tx_tg: UnboundedSender<ServiceCommand>,
     need_new: Arc<AtomicBool>,
     close_ntf:    Arc<Notify>,
     min_restart: u64,
     range: Option<f32>,
+    compress: bool
 ) -> Result<()> {
+    
     let need_open_new = need_new.load(Ordering::SeqCst);
-    need_new.store(true, Ordering::SeqCst);
     
     if need_open_new {
         close_existing_owner_positions(&pool_cfg).await?;
@@ -149,22 +169,22 @@ pub async fn orchestrator_pool(
     // ───── 1. Текущая цена ───────────────────────────────────────────────
     let mut start_time = Instant::now();
     let price_raw = orca_whirlpools_core::sqrt_price_to_price(whirl.sqrt_price.into(), dec_a, dec_b);
-    let invert    = !three_ranges;          // false для SOL/USDC, true для RAY/SOL
+    let invert    = RANGE != Range::Three && RANGE != Range::Two;          // false для SOL/USDC, true для RAY/SOL
     let price_disp = if invert { 1.0 / price_raw } else { price_raw };
     let mut price = norm_price(price_raw, invert);
 
     // ───── 2. Формируем диапазоны / аллокации  ───────────────────────────
     let mut upper_exit = 0.0;
     let mut lower_exit = 0.0;
+    if RANGE == Range::Two && need_open_new {
 
-    if three_ranges && need_open_new {
-        let bounds  = calc_bound_prices_struct(price, &pct_list);
-        let allocs  = calc_range_allocation_struct(price, &bounds, &WEIGHTS, capital_usd);  // ✱ ИЗМЕНЕНО: без sort
-
+        let bounds  = calc_bound_prices_struct_for_two(price, &pct_list);
+        let allocs  = calc_range_allocation_struct_for_two(price, &bounds, &weights, capital_usd);  // ✱ ИЗМЕНЕНО: без sort
+        println!("Allocs: {:?}", allocs);
+        
         let _ = tx_tg.send(ServiceCommand::SendMessage(
-            format!("🔔 Пытаюсь открыть 3 позиции SOL/USDC ({} USDC)…", capital_usd)
+            format!("🔔 Пытаюсь открыть 2 позиции SOL/USDC ({} USDC)…", capital_usd)
         ));
-
         let mut minted: Vec<Role> = Vec::new();   // ✱ ИЗМЕНЕНО: трекаем по роли
         let mut slippage = 150u16;
 
@@ -177,7 +197,7 @@ pub async fn orchestrator_pool(
 
                 // сколько USDC вносить
                 let deposit = match alloc.role {
-                    Role::Middle => alloc.usdc_amount,
+                    Role::Middle | Role::MiddleSmall => alloc.usdc_amount,
                     Role::Up | Role::Down => alloc.usdc_equivalent,
                 };
 
@@ -201,6 +221,102 @@ pub async fn orchestrator_pool(
                             lower_price: alloc.lower_price,
                         };
                         match alloc.role {
+                            Role::MiddleSmall => pool_cfg.position_1 = Some(liq),
+                            Role::Up    => pool_cfg.position_1 = Some(liq),
+                            Role::Middle=> pool_cfg.position_2 = Some(liq),
+                            Role::Down  => pool_cfg.position_3 = Some(liq),
+                        }
+
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(
+                            format!("✅ Открыта {:?} (mint {})", alloc.role, res.position_mint), // ✱ ИЗМЕНЕНО
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx_tg.send(ServiceCommand::SendMessage(
+                            format!("⚠️ {:?} не открылась: {e}", alloc.role),                 // ✱ ИЗМЕНЕНО
+                        ));
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+
+            if minted.len() == 2 { break 'outer; }      // всё открыто
+
+            if !progress { slippage += 100; }
+
+            let _ = tx_tg.send(ServiceCommand::SendMessage(
+                format!("🔄 Раунд {round} окончен, открыто {}/2. Slippage = {} bps", minted.len(), slippage)
+            ));
+        }
+
+        // окончательная проверка
+        if minted.len() != 2 {
+            let _ = tx_tg.send(ServiceCommand::SendMessage(
+                format!("❌ За 3 раунда открыто только {}/2. Закрываю то, что было.", minted.len())
+            ));
+            for r in minted {
+                if let Some(pm) = match r {
+                    Role::MiddleSmall    => &pool_cfg.position_1,
+                    Role::Up    => &pool_cfg.position_1,
+                    Role::Middle=> &pool_cfg.position_2,
+                    Role::Down  => &pool_cfg.position_3,
+                }.as_ref().map(|p| &p.position_nft) {
+                    let _ = close_whirlpool_position(Pubkey::from_str(pm.as_ref().unwrap())?, 150u16).await;
+                }
+            }
+            bail!("Не удалось открыть все два диапазона");
+        }
+
+        upper_exit = pool_cfg.position_2.as_ref().unwrap().upper_price;
+        lower_exit = pool_cfg.position_2.as_ref().unwrap().lower_price;
+
+    }
+    else if RANGE == Range::Three && need_open_new {
+        let bounds  = calc_bound_prices_struct(price, &pct_list, compress.clone());
+        let allocs  = calc_range_allocation_struct(price, &bounds, &weights, capital_usd, compress.clone());  // ✱ ИЗМЕНЕНО: без sort
+        println!("Allocs: {:?}", allocs);
+        let _ = tx_tg.send(ServiceCommand::SendMessage(
+            format!("🔔 Пытаюсь открыть 3 позиции SOL/USDC ({} USDC)…", capital_usd)
+        ));
+
+        let mut minted: Vec<Role> = Vec::new();   // ✱ ИЗМЕНЕНО: трекаем по роли
+        let mut slippage = 150u16;
+
+        'outer: for round in 1..=2 {              // максимум 3 раунда
+            let mut progress = false;
+
+            // проходим в фиксированном порядке Up→Middle→Down
+            for alloc in &allocs {
+                if minted.contains(&alloc.role) { continue }     // уже открыта
+
+                // сколько USDC вносить
+                let deposit: f64 = match alloc.role {
+                    Role::Middle | Role::MiddleSmall => alloc.usdc_amount,
+                    Role::Up | Role::Down => alloc.usdc_equivalent,
+                };
+
+                match open_with_funds_check_universal(
+                    alloc.lower_price,
+                    alloc.upper_price,
+                    deposit,
+                    pool_cfg.clone(),
+                    slippage,
+                    alloc.range_idx,              // ← просто для отладочных логов
+                ).await {
+                    Ok(res) => {
+                        minted.push(alloc.role.clone());  // ✱ ИЗМЕНЕНО
+                        progress = true;
+
+                        let liq = LiqPosition {
+                            role: alloc.role.clone(),
+                            position_address: None,
+                            position_nft:     None,
+                            upper_price: alloc.upper_price,
+                            lower_price: alloc.lower_price,
+                        };
+                        match alloc.role {
+                            Role::MiddleSmall => pool_cfg.position_1 = Some(liq),
                             Role::Up    => pool_cfg.position_1 = Some(liq),
                             Role::Middle=> pool_cfg.position_2 = Some(liq),
                             Role::Down  => pool_cfg.position_3 = Some(liq),
@@ -236,6 +352,7 @@ pub async fn orchestrator_pool(
             ));
             for r in minted {
                 if let Some(pm) = match r {
+                    Role::MiddleSmall    => &pool_cfg.position_1,
                     Role::Up    => &pool_cfg.position_1,
                     Role::Middle=> &pool_cfg.position_2,
                     Role::Down  => &pool_cfg.position_3,
@@ -246,8 +363,8 @@ pub async fn orchestrator_pool(
             bail!("Не удалось открыть все три диапазона");
         }
 
-        upper_exit = pool_cfg.position_1.as_ref().unwrap().upper_price;
-        lower_exit = pool_cfg.position_3.as_ref().unwrap().lower_price;
+        upper_exit = if pool_cfg.position_1.as_ref().unwrap().upper_price > pool_cfg.position_2.as_ref().unwrap().upper_price { pool_cfg.position_1.as_ref().unwrap().upper_price} else { pool_cfg.position_2.as_ref().unwrap().upper_price };
+        lower_exit = if pool_cfg.position_3.as_ref().unwrap().lower_price < pool_cfg.position_2.as_ref().unwrap().lower_price {pool_cfg.position_3.as_ref().unwrap().lower_price} else {pool_cfg.position_2.as_ref().unwrap().lower_price};
 
     } else if need_open_new {
         // ── 1. Текущие границы в “SOL за токен-B” (display) ─────────────────
@@ -333,7 +450,7 @@ pub async fn orchestrator_pool(
         });
 
         // 3) заполняем pool_cfg и границы выхода
-        if three_ranges {
+        if RANGE == Range::Three {
             // ожидаем ровно 3 диапазона
             if infos.len() != 3 {
                 bail!("В пуле {} найдено {} позиций, а должно быть 3", pool_cfg.name, infos.len());
@@ -363,8 +480,10 @@ pub async fn orchestrator_pool(
 
             // «верхний вылет» контролируем по верхней границе первой (Up) позиции,
             // «нижний вылет» — по нижней границе третьей (Down), как и раньше
-            upper_exit = infos[0].upper_price;
-            lower_exit = infos[2].lower_price;
+            upper_exit = if infos[0].upper_price > infos[1].upper_price { infos[0].upper_price } else { infos[1].upper_price };
+            lower_exit = if infos[2].lower_price < infos[1].lower_price { infos[0].lower_price } else { infos[1].lower_price };
+
+
         } else {
             // одиночный диапазон (RAY/SOL, WETH/SOL) – берём первую позицию
             let i = &infos[0];
@@ -385,8 +504,14 @@ pub async fn orchestrator_pool(
             pool_cfg.name, infos.len()
         )));
     }
+    let list = list_positions_for_owner(Some(whirl_pk)).await?;
 
-    _ = triggers::open_position_switch(true, &tx_tg).await?;
+    println!("After positions opening");
+    if list.len() > 0 {
+        need_new.store(true, Ordering::SeqCst);
+    _ = triggers::pool_report_run(true, &tx_tg).await?;
+    }
+    _ = triggers::opening_switcher(false, Some(&tx_tg)).await?;
     // ───── 3. Мониторинг ────────────────────────────────────────────────
 
     // ➊ Price-feed Pyth для базового токена пула
@@ -497,7 +622,7 @@ pub struct PoolReport {
 }
 // reporter.rs
 pub async fn build_pool_report(cfg: &PoolConfig, tx_tg: UnboundedSender<ServiceCommand>, init_wallet_balance: f64) -> Result<PoolReport> {
-    let closing: triggers::Trigger  = triggers::get_trigger("closing").await?.unwrap_or(Trigger{state: false, ..Default::default()});
+    let closing: triggers::Trigger  = triggers::get_trigger("closing").await;
     // 1. RPC / Whirlpool
     let rpc      = utils::init_rpc();
     let whirl_pk = Pubkey::from_str(&cfg.pool_address)?;
@@ -517,7 +642,7 @@ pub async fn build_pool_report(cfg: &PoolConfig, tx_tg: UnboundedSender<ServiceC
             total: 0.0,
         });
     }
-    if list.len() < 3 && closing.state == false {
+    if ((list.len() < 3 && RANGE == Range::Three) || (list.len() < 2 && RANGE == Range::Two)) && closing.state == false {
         _ = close_all_positions(250, None).await?;
         _ = swap_excess_to_usdc(WSOL, 9, 0.05).await?;
         let _ = tx_tg.send(ServiceCommand::SendSignal("Signal! list.len() < 3 && closing.state == false".to_string()));
@@ -555,7 +680,11 @@ pub async fn build_pool_report(cfg: &PoolConfig, tx_tg: UnboundedSender<ServiceC
             }
         }
     }
-    infos.sort_by(|a, b| b.lower_price.partial_cmp(&a.lower_price).unwrap());
+    if crate::params::RANGE == Range::Two{
+        infos.sort_by(|a, b| a.index.partial_cmp(&b.index).unwrap());
+    } else {
+        infos.sort_by(|a, b| b.lower_price.partial_cmp(&a.lower_price).unwrap());
+    }
 
     // 5. Формируем текст и суммируем total
     let icons = ["🍏","🍊","🍎"];
@@ -650,14 +779,14 @@ async fn check_bounds_and_maybe_close(
     wait_before_redeploy: &mut Duration,
 ) -> Result<bool> {
     // 3.2 допустимое отклонение
-    const KOF: f64 = 0.0015;
 
-    let out_of_range = price > upper_exit * (1.0 + KOF)
+    let out_of_range = price > upper_exit
         || price < lower_exit;
 
     if out_of_range {
         // если цена ушла ниже — немедленно выполняем redeploy
-        let lower = price < lower_exit;
+        let lower = price < lower_exit*1.007;
+        println!("lower: {} price: {:.2} lower_exit: {:.2}", lower, price, lower_exit);
         if lower {
             *wait_before_redeploy = Duration::from_secs(0);
         }

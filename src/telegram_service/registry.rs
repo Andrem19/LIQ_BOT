@@ -6,14 +6,14 @@ use crate::telegram_service::tl_engine::ServiceCommand;
 use crate::params::{WETH, WBTC, WSOL, USDC};
 use tokio::sync::Notify;
 use chrono::Utc;
-use crate::wirlpool_services::{
+use crate::dex_services::{
     wirlpool::{close_all_positions, list_positions_for_owner
     },
 };
 use crate::strategies::limit_order;
 use crate::types::PoolConfig;
-use crate::wirlpool_services::swap::execute_swap_tokens;
-use crate::wirlpool_services::get_info::get_sol_price_usd;
+use crate::dex_services::swap::execute_swap_tokens;
+use crate::dex_services::get_info::get_sol_price_usd;
 use spl_associated_token_account::get_associated_token_address;
 use solana_sdk::pubkey::Pubkey;
 use crate::database::general_settings::{update_pct_list_2, update_pct_number};
@@ -29,7 +29,7 @@ use crate::database::general_settings::update_info_interval;
 use crate::database::general_settings::{update_amount, get_general_settings};
 use crate::utils::utils::{init_rpc, load_wallet};
 use crate::database::triggers::Trigger;
-use crate:: wirlpool_services::wirlpool::{increase_liquidity_partial, decrease_liquidity_partial, refresh_balances};
+use crate:: dex_services::wirlpool::{increase_liquidity_partial, decrease_liquidity_partial, refresh_balances};
 
 /// Регистрация всех телеграм-команд
 pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceCommand>, close_ntf:  Arc<Notify>) {
@@ -383,15 +383,23 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
             let tx = Arc::clone(&tx);
             let close_ntf = close_ntf.clone(); 
             async move {
+                let _ = triggers::auto_trade_switch(true, Some(&tx)).await;
+                let _ =triggers::opening_switcher(true, Some(&tx)).await;
                 // мгновенно информируем пользователя
                 let _ = tx.send(ServiceCommand::SendMessage(
                     "🔒 Начинаем закрывать ВСЕ позиции…".into(),
                 ));
+                let mut t = Trigger {
+                    name: "auto_trade".into(),
+                    state: true,
+                    position: "opening".into(),
+                };
     
                 // всё тяжёлое – в фоне
                 let tx_bg = Arc::clone(&tx);
                 tokio::spawn(async move {
                     if let Err(err) = close_all_positions(300, None).await {
+                        let t = triggers::auto_trade_switch(true, Some(&tx)).await;
                         let _ = tx_bg.send(ServiceCommand::SendMessage(
                             format!("❌ Ошибка при закрытии позиций: {err:?}"),
                         ));
@@ -417,12 +425,8 @@ pub fn register_commands(commander: Arc<Commander>, tx: UnboundedSender<ServiceC
                                 "🎉 Все позиции успешно закрыты.".into(),
                             ));
 
-                            let mut t = Trigger {
-                                name: "auto_trade".into(),
-                                state: true,
-                                position: "opening".into(),
-                            };
-                            let t = triggers::upsert_trigger(&t).await;
+
+                            let t = triggers::auto_trade_switch(true, Some(&tx)).await;
                             tokio::time::sleep(Duration::from_secs(10)).await;
 
                         }

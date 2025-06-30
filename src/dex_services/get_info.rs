@@ -23,6 +23,7 @@ use solana_sdk::signature::Signer;
 use orca_whirlpools_client::{
     get_tick_array_address, Position, UpdateFeesAndRewardsBuilder, Whirlpool,
 };
+use crate::database::positions::{update_position_fields, find_position_index_by_nft};
 use crate::types::PoolConfig;
 use crate::{
     params::{KEYPAIR_FILENAME, RPC_URL},
@@ -93,6 +94,7 @@ pub async fn fetch_pool_position_info(
         upper_price:   display_price,
         pct_down:      0.0,
         pct_up:        0.0,
+        index: 0
     };
 
     //------------------------------------------------------------------//
@@ -108,6 +110,9 @@ pub async fn fetch_pool_position_info(
         let pos_acc = safe_get_account(&rpc, &pos_pk).await?;
         let pos     = Position::from_bytes(&pos_acc.data)?;
 
+        let mint_str = pos.position_mint.to_string();
+        let index_pos = find_position_index_by_nft(&mint_str).await?.unwrap_or_default();
+        info.index = index_pos;
         //---------------------- комиссии ------------------------------//
         info.pending_a = pos.fee_owed_a as f64 / 10_f64.powi(dec_a as i32);
         info.pending_b = pos.fee_owed_b as f64 / 10_f64.powi(dec_b as i32);

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::json;
 use tracing::debug;
-use crate::wirlpool_services::net::http_client;
+use crate::dex_services::net::http_client;
 
 const TG_MAX_LEN: usize = 4096;
 

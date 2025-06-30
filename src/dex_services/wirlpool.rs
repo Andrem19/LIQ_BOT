@@ -38,14 +38,14 @@ use orca_whirlpools::{
     set_whirlpools_config_address, HarvestPositionInstruction, IncreaseLiquidityParam,
     WhirlpoolsConfigInput,
 };
+use crate::database::positions::update_position_fields;
 use crate::utils::utils;
 use crate::params::{WALLET_MUTEX, USDC, OVR};
 use orca_whirlpools_core::tick_index_to_price;
 use orca_whirlpools_core::{CollectFeesQuote, U128, sqrt_price_to_price};
-use crate::wirlpool_services::swap::execute_swap_tokens;
+use crate::dex_services::swap::execute_swap_tokens;
 use crate::types::{PoolConfig, OpenPositionResult};
 use crate::utils::op;
-use crate::utils::fetch_wallet_balance_info;
 
 
 const GAP_SOL:  f64 = 0.002;
@@ -193,6 +193,8 @@ pub async fn summarize_harvest_fees(
     })
 }
 
+
+/// Открыть позицию, строго тратя не больше `initial_amount_b` (в USDC-экв.)
 pub async fn open_with_funds_check_universal(
     price_low: f64,
     price_high: f64,
@@ -471,6 +473,25 @@ pub async fn close_all_positions(slippage: u16, pool: Option<Pubkey>) -> Result<
 
     // ИЗМЕНЕНО: вектор для тех, что не удалось закрыть в первом проходе
     let mut failed_mints: Vec<Pubkey> = Vec::new();         // ИЗМЕНЕНО
+
+    let rpc       = utils::init_rpc();
+    let _wallet_guard = WALLET_MUTEX.lock().await;
+
+    let wallet    = utils::load_wallet()?;
+    let wallet_pk = wallet.pubkey();
+
+    let native_mint = Pubkey::from_str(WSOL)?;
+    let ata_a = get_associated_token_address(&wallet_pk, &native_mint);
+    
+    if rpc.get_account(&ata_a).await.is_err() {
+        let ix = create_associated_token_account(
+            &wallet_pk,             // funding_address
+            &wallet_pk,             // wallet_address
+            &native_mint,           
+            &spl_token::id(),
+        );
+        utils::send_and_confirm(rpc.clone(), vec![ix], &[&wallet]).await?;
+    }
 
     // ──────── ПЕРВЫЙ ПРОХОД ────────────────────────────────────────
     for (idx, p) in positions.into_iter().enumerate() {
@@ -1182,4 +1203,3 @@ pub fn position_mode(
     else if price_c >= price_u{ Mode::OnlyB }
     else                      { Mode::Mixed }
 }
-

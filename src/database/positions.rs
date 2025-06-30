@@ -3,6 +3,7 @@ use once_cell::sync::Lazy;
 use sqlx::{Pool, Row, Sqlite, sqlite::SqlitePoolOptions};
 use crate::database::db::DB;
 use chrono::{DateTime, Utc};
+use anyhow::Result;
 use crate::types::{PoolConfig, LiqPosition, Role};
 
 /// Роли позиции
@@ -349,4 +350,82 @@ pub async fn get_wallet_balance() -> sqlx::Result<Option<f64>> {
         .await?;
     Ok(row
         .and_then(|r| r.try_get::<f64, _>("wallet_balance").ok()))
+}
+
+/// Обновить address и/или nft для позиции index = 1..=3.
+/// Если какой-то из параметров = `None`, он не меняется.
+pub async fn update_position_fields(
+    position_index: u8,
+    new_address: Option<&str>,
+    new_nft: Option<&str>,
+) -> sqlx::Result<()> {
+    // проверяем индекс
+    if !(1..=3).contains(&position_index) {
+        return Err(sqlx::Error::Protocol(
+            "Invalid position_index, must be 1, 2 or 3".into(),
+        ));
+    }
+
+    // собираем фрагменты SET
+    let mut sets = Vec::new();
+    if new_address.is_some() {
+        sets.push(format!("position_address_{} = ?", position_index));
+    }
+    if new_nft.is_some() {
+        sets.push(format!("position_nft_{}     = ?", position_index));
+    }
+
+    // если нечего менять — выходим
+    if sets.is_empty() {
+        return Ok(());
+    }
+
+    // финальный SQL
+    let sql = format!(
+        "UPDATE pool_configs SET {} WHERE id = 1",
+        sets.join(", ")
+    );
+
+    // готовим запрос
+    let mut q = sqlx::query(&sql);
+
+    // биндим аргументы в том же порядке, что и в `sets`
+    if let Some(addr) = new_address {
+        q = q.bind(addr);
+    }
+    if let Some(nft) = new_nft {
+        q = q.bind(nft);
+    }
+
+    // выполняем
+    q.execute(&*DB).await?;
+    Ok(())
+}
+
+pub async fn find_position_index_by_nft(position_mint: &str) -> Result<Option<u8>> {
+    // Выбираем из единственной строки три столбца с mint’ами
+    let row_opt = sqlx::query(
+        "SELECT position_nft_1, position_nft_2, position_nft_3 \
+         FROM pool_configs WHERE id = 1"
+    )
+    .fetch_optional(&*DB)
+    .await?;
+
+    if let Some(row) = row_opt {
+        let nft1: Option<String> = row.try_get("position_nft_1")?;
+        let nft2: Option<String> = row.try_get("position_nft_2")?;
+        let nft3: Option<String> = row.try_get("position_nft_3")?;
+
+        if nft1.as_deref() == Some(position_mint) {
+            return Ok(Some(1));
+        }
+        if nft2.as_deref() == Some(position_mint) {
+            return Ok(Some(2));
+        }
+        if nft3.as_deref() == Some(position_mint) {
+            return Ok(Some(3));
+        }
+    }
+    // либо записи вообще нет, либо ни один не совпал
+    Ok(None)
 }

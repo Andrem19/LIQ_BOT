@@ -22,7 +22,7 @@ use solana_sdk::{
 };
 use solana_sdk::transaction::VersionedTransaction;
 use spl_associated_token_account::get_associated_token_address;
-use crate::wirlpool_services::net::http_client;
+use crate::dex_services::net::http_client;
 
 pub const MIN_SWAP_ATOMS: u64  = 10_000;   // ≈ 0.00001 token
 

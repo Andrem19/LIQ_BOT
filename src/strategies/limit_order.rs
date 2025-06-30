@@ -2,6 +2,8 @@ use crate::database::triggers;
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, Context};
 use crate::params::WSOL;
+use tokio::sync::mpsc::UnboundedSender;
+use crate::telegram_service::tl_engine::ServiceCommand;
 use crate::utils::get_sol_price_usd;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,12 +73,9 @@ pub fn parse_thresholds(s: &str) -> Result<Thresholds> {
         .context("Failed to parse Thresholds from JSON")
 }
 
-pub async fn is_limit_trigger_satisfied() -> Result<bool> {
+pub async fn is_limit_trigger_satisfied(tx: &UnboundedSender<ServiceCommand>) -> Result<bool> {
     // 1) Получаем триггер из БД
-    let trigger = match triggers::get_trigger(TRIGGER_NAME).await? {
-        Some(t) if t.state => t,
-        _ => return Ok(false), // нет записи или state=false
-    };
+    let trigger = triggers::get_trigger(TRIGGER_NAME).await;
 
     // 2) Проверяем, что в положении есть данные
     let pos = trigger.position.trim();
@@ -92,6 +91,10 @@ pub async fn is_limit_trigger_satisfied() -> Result<bool> {
     let price = get_sol_price_usd(WSOL, false)
         .await
         .context("Failed to fetch SOL price")?;
+
+    // let _ = tx.send(ServiceCommand::SendMessage(
+    //     format!("Price: {:.2}", price),
+    // ));
 
     // 5) Оцениваем пороги
     let mut triggered = false;

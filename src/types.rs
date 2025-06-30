@@ -35,41 +35,20 @@ pub struct PoolPositionInfo {
     pub upper_price: f64,
     pub pct_down: f64,
     pub pct_up: f64,
+    pub index: u8,
 }
 
-// #[derive(Clone, Debug)]
-// pub enum Role {
-//     Middle,
-//     Up,
-//     Down
-// }
+#[derive(Clone, Debug, PartialEq)]
+pub enum Range {
+    Three,
+    Two,
+    One
+}
 
-// #[derive(Clone, Debug)]
-// pub struct LiqPosition {
-//     pub role: Role,
-//     pub position_address: Option<&'static str>,
-//     pub position_nft: Option<&'static str>,
-//     pub upper_price: f64,
-//     pub lower_price: f64
-// }
-
-// #[derive(Clone, Debug)]
-// pub struct PoolConfig {
-//     pub amount: f64,
-//     pub program:               &'static str,
-//     pub name:                  &'static str,
-//     pub pool_address:          &'static str,
-//     pub position_1:      Option<LiqPosition>,
-//     pub position_2:      Option<LiqPosition>,
-//     pub position_3:      Option<LiqPosition>,
-//     pub mint_a:                &'static str,
-//     pub mint_b:                &'static str,
-//     pub decimal_a:             u16,
-//     pub decimal_b:             u16,
-// }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Role {
     Middle,
+    MiddleSmall,
     Up,
     Down,
 }
@@ -77,6 +56,7 @@ pub enum Role {
 impl Role {
     pub fn as_str(&self) -> &str {
         match self {
+            Role::MiddleSmall => "MiddleSmall",
             Role::Middle => "Middle",
             Role::Up     => "Up",
             Role::Down   => "Down",
@@ -84,6 +64,7 @@ impl Role {
     }
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "MiddleSmall" => Some(Role::MiddleSmall),
             "Middle" => Some(Role::Middle),
             "Up"     => Some(Role::Up),
             "Down"   => Some(Role::Down),
